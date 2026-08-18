@@ -620,20 +620,22 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
             ]))
 
             mtm_table_width = mtm_box_width * n_models
-            left_spacer_width = 0.8*cm
-            right_spacer_width = max(0.2*cm, content_width - mtm_table_width - qr_width - left_spacer_width)
+            right_margin = 0.3*cm
+            middle_spacer_width = max(0.3*cm, content_width - mtm_table_width - qr_width - right_margin)
 
+            # MTM box stays on the left; QR code is pushed to the right edge
             bottom_row = Table(
                 [[mtm_table, "", qr_table, ""]],
-                colWidths=[mtm_table_width, left_spacer_width, qr_width, right_spacer_width],
+                colWidths=[mtm_table_width, middle_spacer_width, qr_width, right_margin],
                 rowHeights=[qr_height]
             )
         else:
-            # No MTM box: center the QR code across the full content width
-            side_spacer_width = (content_width - qr_width) / 2
+            # No MTM box: push the QR code to the right edge of the label
+            right_margin = 0.3*cm
+            left_spacer_width = max(0.3*cm, content_width - qr_width - right_margin)
             bottom_row = Table(
                 [["", qr_table, ""]],
-                colWidths=[side_spacer_width, qr_width, side_spacer_width],
+                colWidths=[left_spacer_width, qr_width, right_margin],
                 rowHeights=[qr_height]
             )
 
