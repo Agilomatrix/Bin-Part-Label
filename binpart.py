@@ -88,157 +88,115 @@ def find_bus_model_column(df_columns):
     return None
 
 
-def detect_bus_model_and_qty(row, qty_veh_col, bus_model_col=None):
+def normalize_model_token(value):
     """
-    Improved bus model detection that properly matches bus model to MTM box
-    Returns a dictionary with keys '7M', '9M', '12M' and their respective quantities
+    Normalize a raw bus-model value into a clean label.
+    Handles things like '9m', '9 M', '9' -> '9M'.
+    Anything that isn't a bare number or number+M is kept as-is (uppercased),
+    so non-numeric model names (e.g. 'LOW FLOOR', 'STD') still work.
     """
-    # Initialize result dictionary
-    result = {'7M': '', '9M': '', '12M': ''}
+    if value is None:
+        return None
+    val = str(value).strip()
+    if not val or val.lower() in ['nan', 'none', 'null']:
+        return None
+    val_upper = val.upper()
 
-    # Get quantity value
+    m = re.search(r'^(\d+)\s*M$', val_upper)
+    if m:
+        return f"{m.group(1)}M"
+
+    m = re.match(r'^(\d+)$', val_upper)
+    if m:
+        return f"{m.group(1)}M"
+
+    m = re.search(r'(\d+)\s*M\b', val_upper)
+    if m:
+        return f"{m.group(1)}M"
+
+    return val_upper
+
+
+def get_unique_bus_models(df, bus_model_col, qty_veh_col):
+    """
+    Scan the whole file and collect the distinct bus model labels that
+    actually appear in it (no hardcoded 7M/9M/12M) - so this adapts to
+    whatever fleet a given client uses.
+    """
+    models = set()
+
+    if bus_model_col and bus_model_col in df.columns:
+        for v in df[bus_model_col].dropna():
+            token = normalize_model_token(v)
+            if token:
+                models.add(token)
+
+    # Also pick up model:qty pairs embedded directly in the qty/veh column,
+    # e.g. "9M:2", "12M-3"
+    if qty_veh_col and qty_veh_col in df.columns:
+        for v in df[qty_veh_col].dropna():
+            val_upper = str(v).upper()
+            for model, _qty in re.findall(r'(\d+M)[:\-\s]*(\d+)', val_upper):
+                models.add(model)
+
+    def sort_key(model):
+        m = re.match(r'^(\d+)M$', model)
+        if m:
+            return (0, int(m.group(1)), model)
+        return (1, 0, model)
+
+    return sorted(models, key=sort_key)
+
+
+def detect_model_qty_map(row, qty_veh_col, bus_model_col, all_models):
+    """
+    For a single row, figure out the quantity that belongs to each of the
+    models detected across the whole file (all_models). Returns a dict
+    {model_label: qty_string}. Models with no data for this row map to ''.
+    """
+    result = {model: '' for model in all_models}
+    if not all_models:
+        return result
+
+    # Get quantity value for this row
     qty_veh = ""
     if qty_veh_col and qty_veh_col in row and pd.notna(row[qty_veh_col]):
         qty_veh_raw = row[qty_veh_col]
         if pd.notna(qty_veh_raw):
             if isinstance(qty_veh_raw, float) and qty_veh_raw.is_integer():
-                qty_veh = str(int(qty_veh_raw))  # Show as whole number
+                qty_veh = str(int(qty_veh_raw))
             else:
-                qty_veh = str(qty_veh_raw).strip()  # Keep decimal if present
+                qty_veh = str(qty_veh_raw).strip()
 
     if not qty_veh:
         return result
 
-    # Method 1: Check if quantity already contains model info (e.g., "9M:2", "7M-3", "12M 5")
-    qty_pattern = r'(\d+M)[:\-\s]*(\d+)'
-    matches = re.findall(qty_pattern, qty_veh.upper())
-
+    # Method 1: qty/veh field itself contains model:qty pairs, e.g. "9M:2"
+    qty_upper = qty_veh.upper()
+    matches = re.findall(r'(\d+M)[:\-\s]*(\d+)', qty_upper)
     if matches:
-        # If we found model-quantity pairs in the qty_veh field itself
         for model, quantity in matches:
             if model in result:
                 result[model] = quantity
         return result
 
-    # Method 2: Look for bus model in dedicated bus model column first
-    detected_model = None
+    # Method 2: dedicated bus model column tells us which model this row is
     if bus_model_col and bus_model_col in row and pd.notna(row[bus_model_col]):
-        bus_model_value = str(row[bus_model_col]).strip().upper()
+        token = normalize_model_token(row[bus_model_col])
+        if token and token in result:
+            result[token] = qty_veh
+            return result
 
-        # Check for exact matches first
-        if bus_model_value in ['7M', '7']:
-            detected_model = '7M'
-        elif bus_model_value in ['9M', '9']:
-            detected_model = '9M'
-        elif bus_model_value in ['12M', '12']:
-            detected_model = '12M'
-        # Check for patterns within the text
-        elif re.search(r'\b7M\b', bus_model_value):
-            detected_model = '7M'
-        elif re.search(r'\b9M\b', bus_model_value):
-            detected_model = '9M'
-        elif re.search(r'\b12M\b', bus_model_value):
-            detected_model = '12M'
-        # Check for standalone numbers
-        elif re.search(r'\b7\b', bus_model_value):
-            detected_model = '7M'
-        elif re.search(r'\b9\b', bus_model_value):
-            detected_model = '9M'
-        elif re.search(r'\b12\b', bus_model_value):
-            detected_model = '12M'
-
-    # If we found a model in the dedicated column, use it
-    if detected_model:
-        result[detected_model] = qty_veh
-        return result
-
-    # Method 3: Search through all columns systematically with priority
-    priority_columns = []
-    other_columns = []
-
+    # Method 3: search any column's text for one of the known model labels
     for col in row.index:
         if pd.notna(row[col]):
-            col_upper = str(col).upper()
-            if any(keyword in col_upper for keyword in ['MODEL', 'BUS', 'VEHICLE', 'TYPE']):
-                priority_columns.append(col)
-            else:
-                other_columns.append(col)
-
-    # Search priority columns first
-    for col in priority_columns:
-        if pd.notna(row[col]):
             value_str = str(row[col]).upper()
+            for model in all_models:
+                if re.search(r'\b' + re.escape(model) + r'\b', value_str):
+                    result[model] = qty_veh
+                    return result
 
-            if re.search(r'\b7M\b', value_str):
-                result['7M'] = qty_veh
-                return result
-            elif re.search(r'\b9M\b', value_str):
-                result['9M'] = qty_veh
-                return result
-            elif re.search(r'\b12M\b', value_str):
-                result['12M'] = qty_veh
-                return result
-            elif re.search(r'\b7\b', value_str) and any(keyword in value_str for keyword in ['BUS', 'METER', 'M']):
-                result['7M'] = qty_veh
-                return result
-            elif re.search(r'\b9\b', value_str) and any(keyword in value_str for keyword in ['BUS', 'METER', 'M']):
-                result['9M'] = qty_veh
-                return result
-            elif re.search(r'\b12\b', value_str) and any(keyword in value_str for keyword in ['BUS', 'METER', 'M']):
-                result['12M'] = qty_veh
-                return result
-
-    # Method 4: Search in other columns as fallback
-    detected_models = []
-    for col in other_columns:
-        if pd.notna(row[col]):
-            value_str = str(row[col]).upper()
-
-            if re.search(r'\b7M\b', value_str):
-                detected_models.append('7M')
-            elif re.search(r'\b9M\b', value_str):
-                detected_models.append('9M')
-            elif re.search(r'\b12M\b', value_str):
-                detected_models.append('12M')
-
-    detected_models = list(dict.fromkeys(detected_models))
-
-    if detected_models:
-        result[detected_models[0]] = qty_veh
-        return result
-
-    # Method 5: Last resort - look for standalone numbers that might indicate bus length
-    for col in row.index:
-        if pd.notna(row[col]):
-            value_str = str(row[col]).strip()
-
-            if value_str == '7':
-                result['7M'] = qty_veh
-                return result
-            elif value_str == '9':
-                result['9M'] = qty_veh
-                return result
-            elif value_str == '12':
-                result['12M'] = qty_veh
-                return result
-
-    # Method 6: If still no model detected, return empty (no boxes filled)
     return result
-
-
-def dataset_has_mtm_info(df, qty_veh_col, bus_model_col):
-    """
-    Scan the whole dataframe once and decide whether it looks like an
-    MTM (7M/9M/12M) client dataset at all. Used for auto-detect mode.
-    """
-    if not qty_veh_col and not bus_model_col:
-        return False
-
-    for _, row in df.iterrows():
-        quantities = detect_bus_model_and_qty(row, qty_veh_col, bus_model_col)
-        if any(v for v in quantities.values()):
-            return True
-    return False
 
 
 def generate_qr_code(data_string):
@@ -344,14 +302,14 @@ def extract_store_location_data_from_excel(row_data):
     return [station_name, store_location, zone, location, floor, rack_no, level_in_rack]
 
 
-def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=None, mtm_box_mode='auto'):
+def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=None, include_mtm_box=True):
     """
     Generate sticker labels with QR code from Excel data.
 
-    mtm_box_mode controls whether the 7M/9M/12M bus-model box is printed:
-      - 'auto'   : detect automatically from the uploaded data (default)
-      - 'always' : always show the box, even if no data is found for a row
-      - 'never'  : never show the box (for clients that don't use MTM)
+    include_mtm_box: True to print the bus-model box, False for clients
+    that don't use it at all. The model labels themselves (e.g. 7M, 9M,
+    12M, or whatever a given client's fleet uses) are always detected
+    directly from the uploaded file - nothing is hardcoded.
     """
     def log(msg):
         if status_callback:
@@ -421,7 +379,10 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
     store_loc_col = next((col for col in cols if 'STORE' in col and 'LOC' in col),
                       next((col for col in cols if 'STORELOCATION' in col), None))
 
-    bus_model_col = find_bus_model_column(original_columns)
+    # NOTE: must detect against the already-uppercased column names (cols),
+    # not the original-case ones - df's own columns were just upper-cased
+    # above, so a name mismatch here would make every row lookup silently fail.
+    bus_model_col = find_bus_model_column(cols)
 
     log(f"Using columns: Part No: {part_no_col}, Description: {desc_col}, Location: {loc_col}, Qty/Bin: {qty_bin_col}")
     if qty_veh_col:
@@ -431,19 +392,19 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
     if bus_model_col:
         log(f"Bus Model Column: {bus_model_col}")
 
-    # ---- Resolve whether the MTM (7M/9M/12M) box should be shown ----
-    if mtm_box_mode == 'always':
-        include_mtm_box = True
-        log("MTM Box Mode: Always include -> printing 7M/9M/12M box on every label")
-    elif mtm_box_mode == 'never':
-        include_mtm_box = False
-        log("MTM Box Mode: Always exclude -> no bus-model box will be printed")
-    else:
-        include_mtm_box = dataset_has_mtm_info(df, qty_veh_col, bus_model_col)
-        if include_mtm_box:
-            log("MTM Box Mode: Auto-detect -> bus model data found, box will be included")
+    # ---- Resolve the bus-model box: which models exist in this file? ----
+    all_models = []
+    render_mtm_box = False
+    if include_mtm_box:
+        all_models = get_unique_bus_models(df, bus_model_col, qty_veh_col)
+        if all_models:
+            render_mtm_box = True
+            log(f"Bus Model Box: Include -> detected models in file: {', '.join(all_models)}")
         else:
-            log("MTM Box Mode: Auto-detect -> no bus model data found, box will be excluded")
+            log("Bus Model Box: Include was selected, but no bus-model data was found in "
+                "the file, so no box will be printed.")
+    else:
+        log("Bus Model Box: Exclude -> no bus-model box will be printed")
 
     # Create document with minimal margins
     doc = SimpleDocTemplate(output_pdf_path, pagesize=STICKER_PAGESIZE,
@@ -623,30 +584,29 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ]))
 
-        if include_mtm_box:
-            mtm_quantities = detect_bus_model_and_qty(row, qty_veh_col, bus_model_col)
+        if render_mtm_box:
+            model_quantities = detect_model_qty_map(row, qty_veh_col, bus_model_col, all_models)
 
-            mtm_box_width = 1.2*cm
+            n_models = len(all_models)
             mtm_row_height = 1.5*cm
 
-            position_matrix_data = [
-                ["7M", "9M", "12M"],
-                [
-                    Paragraph(f"<b>{mtm_quantities['7M']}</b>", ParagraphStyle(
-                        name='Bold7M', fontName='Helvetica-Bold', fontSize=10, alignment=TA_CENTER
-                    )) if mtm_quantities['7M'] else "",
-                    Paragraph(f"<b>{mtm_quantities['9M']}</b>", ParagraphStyle(
-                        name='Bold9M', fontName='Helvetica-Bold', fontSize=10, alignment=TA_CENTER
-                    )) if mtm_quantities['9M'] else "",
-                    Paragraph(f"<b>{mtm_quantities['12M']}</b>", ParagraphStyle(
-                        name='Bold12M', fontName='Helvetica-Bold', fontSize=10, alignment=TA_CENTER
-                    )) if mtm_quantities['12M'] else ""
-                ]
+            # Reserve roughly the same footprint as before for the box area,
+            # but size each column to fit however many models this file has.
+            reserved_area_width = content_width - qr_width - 1.6*cm  # minus spacers
+            mtm_box_width = reserved_area_width / n_models
+            mtm_box_width = max(0.65*cm, min(1.4*cm, mtm_box_width))
+
+            header_row = list(all_models)
+            value_row = [
+                Paragraph(f"<b>{model_quantities[model]}</b>", ParagraphStyle(
+                    name=f'BoldModel_{model}', fontName='Helvetica-Bold', fontSize=9, alignment=TA_CENTER
+                )) if model_quantities[model] else ""
+                for model in all_models
             ]
 
             mtm_table = Table(
-                position_matrix_data,
-                colWidths=[mtm_box_width, mtm_box_width, mtm_box_width],
+                [header_row, value_row],
+                colWidths=[mtm_box_width] * n_models,
                 rowHeights=[mtm_row_height/2, mtm_row_height/2]
             )
 
@@ -655,15 +615,17 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
                 ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
                 ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
                 ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('FONTSIZE', (0, 0), (-1, 0), 8 if n_models > 4 else 9),
+                ('FONTSIZE', (0, 1), (-1, 1), 9),
             ]))
 
+            mtm_table_width = mtm_box_width * n_models
             left_spacer_width = 0.8*cm
-            right_spacer_width = content_width - 3*mtm_box_width - qr_width - left_spacer_width
+            right_spacer_width = max(0.2*cm, content_width - mtm_table_width - qr_width - left_spacer_width)
 
             bottom_row = Table(
                 [[mtm_table, "", qr_table, ""]],
-                colWidths=[3*mtm_box_width, left_spacer_width, qr_width, right_spacer_width],
+                colWidths=[mtm_table_width, left_spacer_width, qr_width, right_spacer_width],
                 rowHeights=[qr_height]
             )
         else:
@@ -716,23 +678,19 @@ def main():
     # Sidebar for configuration
     st.sidebar.header("Configuration")
 
-    st.sidebar.subheader("Bus Model (MTM) Box")
-    mtm_mode_display = st.sidebar.radio(
-        "Should the 7M / 9M / 12M box be printed on the labels?",
-        options=["Auto-detect from data", "Always include", "Always exclude"],
+    st.sidebar.subheader("Bus Model Box")
+    mtm_choice = st.sidebar.radio(
+        "Print the bus-model box on the labels?",
+        options=["Include", "Exclude"],
         index=0,
         help=(
-            "Auto-detect: the box only appears if your file actually has bus-model / "
-            "qty-per-vehicle data. Always include: forces the box on every label. "
-            "Always exclude: use this for clients who don't need the MTM box at all."
+            "Include: the bus-model box is printed, with model labels (7M, 9M, 12M, "
+            "or whatever your file actually contains) detected straight from the "
+            "uploaded data - nothing is hardcoded. Exclude: use this for clients "
+            "who don't need the box at all."
         )
     )
-    mtm_mode_map = {
-        "Auto-detect from data": "auto",
-        "Always include": "always",
-        "Always exclude": "never",
-    }
-    mtm_box_mode = mtm_mode_map[mtm_mode_display]
+    include_mtm_box = (mtm_choice == "Include")
 
     # File upload
     st.header("📁 File Upload")
@@ -801,17 +759,17 @@ def main():
                 st.info(f"**Qty/Vehicle Column:** {qty_veh_col_disp if qty_veh_col_disp else 'Not detected'}")
                 st.info(f"**Bus Model Column:** {bus_model_col_disp if bus_model_col_disp else 'Not detected'}")
 
-            # Show what auto-detect would decide, for transparency
-            if mtm_box_mode == 'auto':
+            # Show which bus models were actually detected in this file
+            if include_mtm_box:
                 df_check = df_full.copy()
                 df_check.columns = [c.upper() if isinstance(c, str) else c for c in df_check.columns]
                 qty_veh_col_check = next((col for col in df_check.columns if any(term in str(col) for term in ['QTY/VEH', 'QTY_VEH', 'QTY PER VEH', 'QTYVEH', 'QTYPERCAR', 'QTYCAR', 'QTY/CAR'])), None)
-                bus_model_col_check = find_bus_model_column(df_full.columns.tolist())
-                would_include = dataset_has_mtm_info(df_full.rename(columns=dict(zip(df_full.columns, df_check.columns))), qty_veh_col_check, bus_model_col_check)
-                if would_include:
-                    st.success("🚌 Auto-detect: MTM box WILL be printed (bus-model data found)")
+                bus_model_col_check = find_bus_model_column(df_check.columns.tolist())
+                detected_models = get_unique_bus_models(df_check, bus_model_col_check, qty_veh_col_check)
+                if detected_models:
+                    st.success(f"🚌 Bus models detected in this file: {', '.join(detected_models)}")
                 else:
-                    st.info("🚌 Auto-detect: MTM box will NOT be printed (no bus-model data found)")
+                    st.warning("🚌 Include is selected, but no bus-model data was found in this file — the box won't be printed.")
 
         except Exception as e:
             st.error(f"Error analyzing columns: {e}")
@@ -840,7 +798,7 @@ def main():
                         temp_input_path,
                         temp_output_path,
                         status_callback=update_status,
-                        mtm_box_mode=mtm_box_mode
+                        include_mtm_box=include_mtm_box
                     )
 
                     if result_path:
@@ -891,7 +849,7 @@ def main():
             - 📏 Standard sticker size (10cm x 15cm)
             - 🔢 QR code for each part (Part No, Qty, Delivery Location, Storage Location)
             - 📍 Location tracking
-            - 🚌 Bus model box (7M, 9M, 12M) — auto-detected or forced on/off
+            - 🚌 Bus model box — models detected directly from your file, Include/Exclude toggle
             - 📦 Quantity per bin/vehicle
             """)
 
@@ -912,7 +870,7 @@ def main():
 
         st.subheader("📋 Instructions")
         st.markdown("""
-        1. **Choose the MTM Box setting** in the sidebar — Auto-detect, Always include, or Always exclude
+        1. **Choose Include or Exclude** for the Bus Model Box in the sidebar
         2. **Upload your file** - Excel (.xlsx, .xls) or CSV format
         3. **Review data preview** - Check if your data looks correct
         4. **Verify column detection** - Ensure columns are properly identified
@@ -923,12 +881,11 @@ def main():
         st.subheader("💡 Tips")
         st.markdown("""
         - Use clear column headers like "Part No", "Description", "Location"
-        - For bus models, use "7M", "9M", "12M" format
+        - Bus model labels are read straight from your file — "7M", "9M", "12M", or any
+          other model names your fleet uses; nothing is hardcoded
         - Include quantity information in "Qty/Bin" or "Qty/Veh" columns
         - Location strings will be automatically parsed into components
-        - Clients that don't use MTM can simply pick **"Always exclude"** in the sidebar,
-          or leave it on **"Auto-detect"** and the box will disappear on its own since no
-          bus-model data will be found in their file
+        - Clients that don't use bus models at all can simply pick **"Exclude"** in the sidebar
         """)
 
         st.subheader("📊 Sample Data Format")
