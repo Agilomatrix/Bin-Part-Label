@@ -863,7 +863,7 @@ def main():
     # ---- Sidebar: Settings ----
     st.sidebar.header("Settings")
 
-    st.sidebar.subheader("Bus Model Box")
+    st.sidebar.subheader("Model Box")
     mtm_choice = st.sidebar.radio(
         "Print the bus-model box on the labels?",
         options=["Include", "Exclude"],
