@@ -23,6 +23,13 @@ STICKER_PAGESIZE = (STICKER_WIDTH, STICKER_HEIGHT)
 CONTENT_BOX_WIDTH = 10 * cm  # Same width as page
 CONTENT_BOX_HEIGHT = 7.2 * cm  # Half the page height
 
+# Columns used for the manual-entry / mastersheet-template workflow
+TEMPLATE_COLUMNS = [
+    'Part No', 'Description', 'Location', 'Qty/Bin', 'Qty/Veh', 'Model', 'Store Location',
+    'Station No', 'Rack', 'Rack No (1st digit)', 'Rack No (2nd digit)', 'Level', 'Cell',
+    'Station Name', 'ABB ZONE', 'ABB LOCATION', 'ABB FLOOR', 'ABB RACK NO', 'ABB LEVEL IN RACK'
+]
+
 # Check for PIL and install if needed
 try:
     from PIL import Image as PILImage
@@ -45,25 +52,44 @@ except ImportError:
     import qrcode
     QR_AVAILABLE = True
 
+# Check for openpyxl (needed to write the downloadable template)
+try:
+    import openpyxl  # noqa: F401
+except ImportError:
+    st.write("openpyxl not available. Installing...")
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'openpyxl'])
+    import openpyxl  # noqa: F401
+
 # Define paragraph styles
 bold_style = ParagraphStyle(name='Bold', fontName='Helvetica-Bold', fontSize=16, alignment=TA_CENTER, leading=14)
 desc_style = ParagraphStyle(name='Description', fontName='Helvetica', fontSize=11, alignment=TA_CENTER, leading=12)
 qty_style = ParagraphStyle(name='Quantity', fontName='Helvetica', fontSize=11, alignment=TA_CENTER, leading=12)
 
 
-def find_bus_model_column(df_columns):
+def find_model_column(df_columns):
     """
-    Enhanced function to find the bus model column with better detection
+    Find the "Model" column for a client's parts file. Generic by default
+    (works for any product line), but still recognizes bus/vehicle-style
+    headers for clients migrating from older sheets.
     """
     cols = [str(col).upper() for col in df_columns]
 
-    # Priority order for bus model column detection
+    # Priority order for model column detection
     patterns = [
-        # Exact matches (highest priority)
+        # Exact matches (highest priority) - generic first
+        lambda col: col == 'MODEL',
+        lambda col: col == 'PRODUCT_MODEL',
+        lambda col: col == 'PRODUCTMODEL',
+        lambda col: col == 'PRODUCT MODEL',
+        lambda col: col == 'ITEM_MODEL',
+        lambda col: col == 'ITEM MODEL',
+        # Legacy / vehicle-style exact matches (kept for backward compatibility)
         lambda col: col == 'BUS_MODEL',
         lambda col: col == 'BUSMODEL',
         lambda col: col == 'BUS MODEL',
-        lambda col: col == 'MODEL',
+        lambda col: col == 'VEHICLE_MODEL',
+        lambda col: col == 'VEHICLEMODEL',
+        lambda col: col == 'VEHICLE MODEL',
         lambda col: col == 'BUS_TYPE',
         lambda col: col == 'BUSTYPE',
         lambda col: col == 'BUS TYPE',
@@ -71,11 +97,9 @@ def find_bus_model_column(df_columns):
         lambda col: col == 'VEHICLETYPE',
         lambda col: col == 'VEHICLE TYPE',
         # Partial matches (lower priority)
-        lambda col: 'BUS' in col and 'MODEL' in col,
-        lambda col: 'BUS' in col and 'TYPE' in col,
-        lambda col: 'VEHICLE' in col and 'MODEL' in col,
-        lambda col: 'VEHICLE' in col and 'TYPE' in col,
         lambda col: 'MODEL' in col,
+        lambda col: 'BUS' in col and 'TYPE' in col,
+        lambda col: 'VEHICLE' in col and 'TYPE' in col,
         lambda col: 'BUS' in col,
         lambda col: 'VEHICLE' in col,
     ]
@@ -90,10 +114,10 @@ def find_bus_model_column(df_columns):
 
 def normalize_model_token(value):
     """
-    Normalize a raw bus-model value into a clean label.
+    Normalize a raw model value into a clean label.
     Handles things like '9m', '9 M', '9' -> '9M'.
     Anything that isn't a bare number or number+M is kept as-is (uppercased),
-    so non-numeric model names (e.g. 'LOW FLOOR', 'STD') still work.
+    so non-numeric model names (e.g. 'LOW FLOOR', 'TYPE-A', 'STD') still work.
     """
     if value is None:
         return None
@@ -117,16 +141,16 @@ def normalize_model_token(value):
     return val_upper
 
 
-def get_unique_bus_models(df, bus_model_col, qty_veh_col):
+def get_unique_models(df, model_col, qty_veh_col):
     """
-    Scan the whole file and collect the distinct bus model labels that
+    Scan the whole file and collect the distinct model labels that
     actually appear in it (no hardcoded 7M/9M/12M) - so this adapts to
-    whatever fleet a given client uses.
+    whatever product line/fleet a given client uses.
     """
     models = set()
 
-    if bus_model_col and bus_model_col in df.columns:
-        for v in df[bus_model_col].dropna():
+    if model_col and model_col in df.columns:
+        for v in df[model_col].dropna():
             token = normalize_model_token(v)
             if token:
                 models.add(token)
@@ -148,7 +172,7 @@ def get_unique_bus_models(df, bus_model_col, qty_veh_col):
     return sorted(models, key=sort_key)
 
 
-def detect_model_qty_map(row, qty_veh_col, bus_model_col, all_models):
+def detect_model_qty_map(row, qty_veh_col, model_col, all_models):
     """
     For a single row, figure out the quantity that belongs to each of the
     models detected across the whole file (all_models). Returns a dict
@@ -180,9 +204,9 @@ def detect_model_qty_map(row, qty_veh_col, bus_model_col, all_models):
                 result[model] = quantity
         return result
 
-    # Method 2: dedicated bus model column tells us which model this row is
-    if bus_model_col and bus_model_col in row and pd.notna(row[bus_model_col]):
-        token = normalize_model_token(row[bus_model_col])
+    # Method 2: dedicated model column tells us which model this row is
+    if model_col and model_col in row and pd.notna(row[model_col]):
+        token = normalize_model_token(row[model_col])
         if token and token in result:
             result[token] = qty_veh
             return result
@@ -265,7 +289,7 @@ def extract_location_data_from_excel(row_data):
                     return str(val) if pd.notna(val) and str(val).lower() != 'nan' else default
         return default
 
-    bus_model = find_column_value(['Bus Model', 'Bus model', 'BUS MODEL', 'BUSMODEL', 'Bus_Model'])
+    model = find_column_value(['Model', 'MODEL', 'Bus Model', 'Bus model', 'BUS MODEL', 'BUSMODEL', 'Bus_Model'])
     station_no = find_column_value(['Station No', 'Station no', 'STATION NO', 'STATIONNO', 'Station_No'])
     rack = find_column_value(['Rack', 'RACK', 'rack'])
     rack_no_1st = find_column_value(['Rack No (1st digit)', 'RACK NO (1st digit)', 'Rack_No_1st', 'RACK_NO_1ST'])
@@ -273,7 +297,7 @@ def extract_location_data_from_excel(row_data):
     level = find_column_value(['Level', 'LEVEL', 'level'])
     cell = find_column_value(['Cell', 'CELL', 'cell'])
 
-    return [bus_model, station_no, rack, rack_no_1st, rack_no_2nd, level, cell]
+    return [model, station_no, rack, rack_no_1st, rack_no_2nd, level, cell]
 
 
 def extract_store_location_data_from_excel(row_data):
@@ -302,22 +326,58 @@ def extract_store_location_data_from_excel(row_data):
     return [station_name, store_location, zone, location, floor, rack_no, level_in_rack]
 
 
-def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=None, include_mtm_box=True):
+def create_blank_mastersheet_bytes():
     """
-    Generate sticker labels with QR code from Excel data.
+    Build a downloadable .xlsx template with every column the label
+    generator understands, pre-filled with one example row so users know
+    the expected format. Used for bulk uploads.
+    """
+    example_row = {
+        'Part No': 'ABC123',
+        'Description': 'Engine Filter',
+        'Location': 'A1_B2_C3',
+        'Qty/Bin': 5,
+        'Qty/Veh': 2,
+        'Model': '9M',
+        'Store Location': 'Main Store',
+        'Station No': '',
+        'Rack': '',
+        'Rack No (1st digit)': '',
+        'Rack No (2nd digit)': '',
+        'Level': '',
+        'Cell': '',
+        'Station Name': '',
+        'ABB ZONE': '',
+        'ABB LOCATION': '',
+        'ABB FLOOR': '',
+        'ABB RACK NO': '',
+        'ABB LEVEL IN RACK': ''
+    }
+    template_df = pd.DataFrame([example_row], columns=TEMPLATE_COLUMNS)
 
-    include_mtm_box: True to print the bus-model box, False for clients
-    that don't use it at all. The model labels themselves (e.g. 7M, 9M,
-    12M, or whatever a given client's fleet uses) are always detected
-    directly from the uploaded file - nothing is hardcoded.
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        template_df.to_excel(writer, index=False, sheet_name='Labels')
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, include_model_box=True):
+    """
+    Core sticker-generation logic. Accepts an already-loaded DataFrame, so
+    it can be reused both for bulk file uploads and for a small DataFrame
+    built from manual entry.
+
+    include_model_box: True to print the model box, False for clients
+    that don't need it at all. The model labels themselves (e.g. 7M, 9M,
+    12M, Type-A, or whatever a given client's product line uses) are
+    always detected directly from the data - nothing is hardcoded.
     """
     def log(msg):
         if status_callback:
             status_callback(msg)
         else:
             st.write(msg)
-
-    log(f"Processing file: {excel_file_path}")
 
     # Create a function to draw the border box around content
     def draw_border(canvas, doc):
@@ -334,27 +394,10 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
         )
         canvas.restoreState()
 
-    # Load the Excel data
-    try:
-        if excel_file_path.lower().endswith('.csv'):
-            df = pd.read_csv(excel_file_path)
-        else:
-            try:
-                df = pd.read_excel(excel_file_path)
-            except Exception:
-                try:
-                    df = pd.read_excel(excel_file_path, engine='openpyxl')
-                except Exception:
-                    df = pd.read_csv(excel_file_path, encoding='latin1')
-
-        log(f"Successfully read file with {len(df)} rows")
-        log(f"Columns found: {df.columns.tolist()}")
-    except Exception as e:
-        log(f"Error reading file: {e}")
-        return None
+    log(f"Preparing {len(df)} label(s)")
 
     # Identify columns (case-insensitive)
-    original_columns = df.columns.tolist()
+    df = df.copy()
     df.columns = [col.upper() if isinstance(col, str) else col for col in df.columns]
     cols = df.columns.tolist()
 
@@ -382,29 +425,29 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
     # NOTE: must detect against the already-uppercased column names (cols),
     # not the original-case ones - df's own columns were just upper-cased
     # above, so a name mismatch here would make every row lookup silently fail.
-    bus_model_col = find_bus_model_column(cols)
+    model_col = find_model_column(cols)
 
     log(f"Using columns: Part No: {part_no_col}, Description: {desc_col}, Location: {loc_col}, Qty/Bin: {qty_bin_col}")
     if qty_veh_col:
         log(f"Qty/Veh Column: {qty_veh_col}")
     if store_loc_col:
         log(f"Store Location Column: {store_loc_col}")
-    if bus_model_col:
-        log(f"Bus Model Column: {bus_model_col}")
+    if model_col:
+        log(f"Model Column: {model_col}")
 
-    # ---- Resolve the bus-model box: which models exist in this file? ----
+    # ---- Resolve the model box: which models exist in this file? ----
     all_models = []
-    render_mtm_box = False
-    if include_mtm_box:
-        all_models = get_unique_bus_models(df, bus_model_col, qty_veh_col)
+    render_model_box = False
+    if include_model_box:
+        all_models = get_unique_models(df, model_col, qty_veh_col)
         if all_models:
-            render_mtm_box = True
-            log(f"Bus Model Box: Include -> detected models in file: {', '.join(all_models)}")
+            render_model_box = True
+            log(f"Model Box: Include -> detected models: {', '.join(all_models)}")
         else:
-            log("Bus Model Box: Include was selected, but no bus-model data was found in "
-                "the file, so no box will be printed.")
+            log("Model Box: Include was selected, but no model data was found, "
+                "so no box will be printed.")
     else:
-        log("Bus Model Box: Exclude -> no bus-model box will be printed")
+        log("Model Box: Exclude -> no model box will be printed")
 
     # Create document with minimal margins
     doc = SimpleDocTemplate(output_pdf_path, pagesize=STICKER_PAGESIZE,
@@ -560,7 +603,7 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
         elements.append(line_loc_table)
         elements.append(Spacer(1, 0.3*cm))
 
-        # ---- Bottom section: MTM box (optional) + QR code ----
+        # ---- Bottom section: Model box (optional) + QR code ----
         qr_width = 2.5*cm
         qr_height = 2.5*cm
 
@@ -584,17 +627,17 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ]))
 
-        if render_mtm_box:
-            model_quantities = detect_model_qty_map(row, qty_veh_col, bus_model_col, all_models)
+        if render_model_box:
+            model_quantities = detect_model_qty_map(row, qty_veh_col, model_col, all_models)
 
             n_models = len(all_models)
-            mtm_row_height = 1.5*cm
+            model_row_height = 1.5*cm
 
             # Reserve roughly the same footprint as before for the box area,
             # but size each column to fit however many models this file has.
             reserved_area_width = content_width - qr_width - 1.6*cm  # minus spacers
-            mtm_box_width = reserved_area_width / n_models
-            mtm_box_width = max(0.65*cm, min(1.4*cm, mtm_box_width))
+            model_box_width = reserved_area_width / n_models
+            model_box_width = max(0.65*cm, min(1.4*cm, model_box_width))
 
             header_row = list(all_models)
             value_row = [
@@ -604,13 +647,13 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
                 for model in all_models
             ]
 
-            mtm_table = Table(
+            model_table = Table(
                 [header_row, value_row],
-                colWidths=[mtm_box_width] * n_models,
-                rowHeights=[mtm_row_height/2, mtm_row_height/2]
+                colWidths=[model_box_width] * n_models,
+                rowHeights=[model_row_height/2, model_row_height/2]
             )
 
-            mtm_table.setStyle(TableStyle([
+            model_table.setStyle(TableStyle([
                 ('GRID', (0, 0), (-1, -1), 1.2, colors.Color(0, 0, 0, alpha=0.95)),
                 ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
                 ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
@@ -619,18 +662,18 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
                 ('FONTSIZE', (0, 1), (-1, 1), 9),
             ]))
 
-            mtm_table_width = mtm_box_width * n_models
+            model_table_width = model_box_width * n_models
             right_margin = 0.3*cm
-            middle_spacer_width = max(0.3*cm, content_width - mtm_table_width - qr_width - right_margin)
+            middle_spacer_width = max(0.3*cm, content_width - model_table_width - qr_width - right_margin)
 
-            # MTM box stays on the left; QR code is pushed to the right edge
+            # Model box stays on the left; QR code is pushed to the right edge
             bottom_row = Table(
-                [[mtm_table, "", qr_table, ""]],
-                colWidths=[mtm_table_width, middle_spacer_width, qr_width, right_margin],
+                [[model_table, "", qr_table, ""]],
+                colWidths=[model_table_width, middle_spacer_width, qr_width, right_margin],
                 rowHeights=[qr_height]
             )
         else:
-            # No MTM box: push the QR code to the right edge of the label
+            # No model box: push the QR code to the right edge of the label
             right_margin = 0.3*cm
             left_spacer_width = max(0.3*cm, content_width - qr_width - right_margin)
             bottom_row = Table(
@@ -664,6 +707,44 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
         return None
 
 
+def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=None, include_model_box=True):
+    """
+    Generate sticker labels with QR code from an Excel/CSV file on disk.
+    Loads the file into a DataFrame, then hands off to the shared core
+    generator (generate_sticker_labels_core) used by both bulk upload and
+    manual entry.
+    """
+    def log(msg):
+        if status_callback:
+            status_callback(msg)
+        else:
+            st.write(msg)
+
+    log(f"Processing file: {excel_file_path}")
+
+    # Load the Excel data
+    try:
+        if excel_file_path.lower().endswith('.csv'):
+            df = pd.read_csv(excel_file_path)
+        else:
+            try:
+                df = pd.read_excel(excel_file_path)
+            except Exception:
+                try:
+                    df = pd.read_excel(excel_file_path, engine='openpyxl')
+                except Exception:
+                    df = pd.read_csv(excel_file_path, encoding='latin1')
+
+        log(f"Successfully read file with {len(df)} rows")
+        log(f"Columns found: {df.columns.tolist()}")
+    except Exception as e:
+        log(f"Error reading file: {e}")
+        return None
+
+    return generate_sticker_labels_core(df, output_pdf_path, status_callback=status_callback,
+                                         include_model_box=include_model_box)
+
+
 def main():
     """Main Streamlit application"""
     st.set_page_config(page_title="Bin Label Generator", page_icon="🏷️", layout="wide")
@@ -680,22 +761,45 @@ def main():
     # Sidebar for configuration
     st.sidebar.header("Configuration")
 
-    st.sidebar.subheader("Bus Model Box")
-    mtm_choice = st.sidebar.radio(
-        "Print the bus-model box on the labels?",
+    st.sidebar.subheader("Model Box")
+    model_choice = st.sidebar.radio(
+        "Print the model box on the labels?",
         options=["Include", "Exclude"],
         index=0,
         help=(
-            "Include: the bus-model box is printed, with model labels (7M, 9M, 12M, "
-            "or whatever your file actually contains) detected straight from the "
-            "uploaded data - nothing is hardcoded. Exclude: use this for clients "
-            "who don't need the box at all."
+            "Include: the model box is printed, with model labels (e.g. 7M, 9M, "
+            "12M, Type-A, or whatever your file actually contains) detected "
+            "straight from your data - nothing is hardcoded. Exclude: use this "
+            "for clients who don't need the box at all."
         )
     )
-    include_mtm_box = (mtm_choice == "Include")
+    include_model_box = (model_choice == "Include")
 
-    # File upload
-    st.header("📁 File Upload")
+    # ---- Choose how labels are added ----
+    st.header("📁 Add Labels")
+    entry_mode = st.radio(
+        "How would you like to add labels?",
+        options=["Upload file (bulk)", "Manual entry (1-2 labels)"],
+        index=0,
+        horizontal=True,
+        help="Use bulk upload for many labels at once. Use manual entry when you just need one or two labels quickly."
+    )
+
+    if entry_mode == "Upload file (bulk)":
+        _run_bulk_upload_flow(include_model_box)
+    else:
+        _run_manual_entry_flow(include_model_box)
+
+
+def _run_bulk_upload_flow(include_model_box):
+    st.caption("New to this? Download a blank template, fill it in, then upload it below.")
+    st.download_button(
+        label="📄 Download blank mastersheet template",
+        data=create_blank_mastersheet_bytes(),
+        file_name="mastersheet_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
     uploaded_file = st.file_uploader(
         "Choose an Excel or CSV file",
         type=['xlsx', 'xls', 'csv'],
@@ -747,7 +851,7 @@ def main():
 
             qty_veh_col_disp = next((col for col in cols_upper if any(term in col for term in ['QTY/VEH', 'QTY_VEH', 'QTY PER VEH', 'QTYVEH'])), '')
 
-            bus_model_col_disp = find_bus_model_column(df_full.columns.tolist())
+            model_col_disp = find_model_column(df_full.columns.tolist())
 
             col1, col2 = st.columns(2)
 
@@ -759,19 +863,19 @@ def main():
             with col2:
                 st.info(f"**Qty/Bin Column:** {qty_bin_col}")
                 st.info(f"**Qty/Vehicle Column:** {qty_veh_col_disp if qty_veh_col_disp else 'Not detected'}")
-                st.info(f"**Bus Model Column:** {bus_model_col_disp if bus_model_col_disp else 'Not detected'}")
+                st.info(f"**Model Column:** {model_col_disp if model_col_disp else 'Not detected'}")
 
-            # Show which bus models were actually detected in this file
-            if include_mtm_box:
+            # Show which models were actually detected in this file
+            if include_model_box:
                 df_check = df_full.copy()
                 df_check.columns = [c.upper() if isinstance(c, str) else c for c in df_check.columns]
                 qty_veh_col_check = next((col for col in df_check.columns if any(term in str(col) for term in ['QTY/VEH', 'QTY_VEH', 'QTY PER VEH', 'QTYVEH', 'QTYPERCAR', 'QTYCAR', 'QTY/CAR'])), None)
-                bus_model_col_check = find_bus_model_column(df_check.columns.tolist())
-                detected_models = get_unique_bus_models(df_check, bus_model_col_check, qty_veh_col_check)
+                model_col_check = find_model_column(df_check.columns.tolist())
+                detected_models = get_unique_models(df_check, model_col_check, qty_veh_col_check)
                 if detected_models:
-                    st.success(f"🚌 Bus models detected in this file: {', '.join(detected_models)}")
+                    st.success(f"📋 Models detected in this file: {', '.join(detected_models)}")
                 else:
-                    st.warning("🚌 Include is selected, but no bus-model data was found in this file — the box won't be printed.")
+                    st.warning("📋 Include is selected, but no model data was found in this file — the box won't be printed.")
 
         except Exception as e:
             st.error(f"Error analyzing columns: {e}")
@@ -784,7 +888,6 @@ def main():
 
         with col1:
             if st.button("🏷️ Generate PDF Labels", type="primary", use_container_width=True):
-                progress_container = st.empty()
                 status_container = st.empty()
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_output:
@@ -800,7 +903,7 @@ def main():
                         temp_input_path,
                         temp_output_path,
                         status_callback=update_status,
-                        include_mtm_box=include_mtm_box
+                        include_model_box=include_model_box
                     )
 
                     if result_path:
@@ -840,66 +943,193 @@ def main():
             if st.button("🔍 Preview Sample", use_container_width=True):
                 st.info("Preview functionality - shows first label design")
 
-        # Additional information
-        st.subheader("ℹ️ Label Information")
-
-        info_col1, info_col2 = st.columns(2)
-
-        with info_col1:
-            st.markdown("""
-            **Label Features:**
-            - 📏 Standard sticker size (10cm x 15cm)
-            - 🔢 QR code for each part (Part No, Qty, Delivery Location, Storage Location)
-            - 📍 Location tracking
-            - 🚌 Bus model box — models detected directly from your file, Include/Exclude toggle
-            - 📦 Quantity per bin/vehicle
-            """)
-
-        with info_col2:
-            st.markdown("""
-            **Supported Columns:**
-            - Part Number/Part No
-            - Description/Name
-            - Location/Position
-            - Qty/Bin, Quantity
-            - Qty/Veh, Qty per Vehicle
-            - Bus Model/Vehicle Type
-            - Store Location
-            """)
+        _render_info_sections()
 
     else:
         st.info("👆 Please upload an Excel or CSV file to get started")
+        _render_bulk_instructions()
+        _render_sample_data()
 
-        st.subheader("📋 Instructions")
+
+def _run_manual_entry_flow(include_model_box):
+    if 'manual_labels' not in st.session_state:
+        st.session_state.manual_labels = [{}]
+
+    st.caption(
+        "Fill in the blanks for each label below — no spreadsheet needed. "
+        "Add more labels or remove ones you don't need."
+    )
+
+    to_remove = None
+    for i, label in enumerate(st.session_state.manual_labels):
+        cols = st.columns([1.2, 1.6, 0.9, 1.2, 0.8, 0.8, 1.3, 0.3])
+        label['part_no'] = cols[0].text_input("Part No", value=label.get('part_no', ''), key=f"part_no_{i}")
+        label['description'] = cols[1].text_input("Description", value=label.get('description', ''), key=f"desc_{i}")
+        label['model'] = cols[2].text_input("Model", value=label.get('model', ''), key=f"model_{i}")
+        label['location'] = cols[3].text_input("Location", value=label.get('location', ''), key=f"loc_{i}")
+        label['qty_bin'] = cols[4].text_input("Qty/Bin", value=label.get('qty_bin', ''), key=f"qtybin_{i}")
+        label['qty_veh'] = cols[5].text_input("Qty/Veh", value=label.get('qty_veh', ''), key=f"qtyveh_{i}")
+        label['store_location'] = cols[6].text_input("Store Location", value=label.get('store_location', ''), key=f"storeloc_{i}")
+        cols[7].markdown("<div style='height: 1.85em'></div>", unsafe_allow_html=True)
+        if cols[7].button("✕", key=f"remove_{i}", help="Remove this label"):
+            to_remove = i
+
+    if to_remove is not None:
+        if len(st.session_state.manual_labels) > 1:
+            st.session_state.manual_labels.pop(to_remove)
+        else:
+            st.session_state.manual_labels[0] = {}
+        st.rerun()
+
+    if st.button("+ Add label"):
+        st.session_state.manual_labels.append({})
+        st.rerun()
+
+    st.markdown("---")
+    st.caption(
+        "Need more than a couple of labels? Switch to **Upload file (bulk)** above, "
+        "or download a blank template to fill in offline and upload later."
+    )
+    st.download_button(
+        label="📄 Download blank mastersheet template",
+        data=create_blank_mastersheet_bytes(),
+        file_name="mastersheet_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    rows = []
+    for label in st.session_state.manual_labels:
+        if any(str(v).strip() for v in label.values()):
+            rows.append({
+                'Part No': label.get('part_no', ''),
+                'Description': label.get('description', ''),
+                'Model': label.get('model', ''),
+                'Location': label.get('location', ''),
+                'Qty/Bin': label.get('qty_bin', ''),
+                'Qty/Veh': label.get('qty_veh', ''),
+                'Store Location': label.get('store_location', ''),
+            })
+
+    st.subheader("🚀 Generate Labels")
+
+    if not rows:
+        st.info("Fill in at least one label's blanks (Part No, Description) to generate labels.")
+        return
+
+    if st.button("🏷️ Generate PDF Labels", type="primary"):
+        manual_df = pd.DataFrame(rows)
+        status_container = st.empty()
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_output:
+            temp_output_path = tmp_output.name
+
+        def update_status(message):
+            status_container.info(f"📊 {message}")
+
+        try:
+            update_status("Starting label generation...")
+
+            result_path = generate_sticker_labels_core(
+                manual_df,
+                temp_output_path,
+                status_callback=update_status,
+                include_model_box=include_model_box
+            )
+
+            if result_path:
+                with open(result_path, 'rb') as pdf_file:
+                    pdf_data = pdf_file.read()
+
+                status_container.success("✅ Labels generated successfully!")
+
+                st.download_button(
+                    label="📥 Download PDF Labels",
+                    data=pdf_data,
+                    file_name="sticker_labels_manual.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+
+                file_size = len(pdf_data) / 1024
+                st.info(f"📄 PDF size: {file_size:.1f} KB | Labels: {len(manual_df)}")
+            else:
+                status_container.error("❌ Failed to generate labels")
+
+        except Exception as e:
+            status_container.error(f"❌ Error: {str(e)}")
+            st.exception(e)
+
+        finally:
+            try:
+                if os.path.exists(temp_output_path):
+                    os.unlink(temp_output_path)
+            except Exception:
+                pass
+
+
+def _render_info_sections():
+    st.subheader("ℹ️ Label Information")
+
+    info_col1, info_col2 = st.columns(2)
+
+    with info_col1:
         st.markdown("""
-        1. **Choose Include or Exclude** for the Bus Model Box in the sidebar
-        2. **Upload your file** - Excel (.xlsx, .xls) or CSV format
-        3. **Review data preview** - Check if your data looks correct
-        4. **Verify column detection** - Ensure columns are properly identified
-        5. **Generate labels** - Click the button to create your PDF
-        6. **Download** - Get your professional sticker labels
+        **Label Features:**
+        - 📏 Standard sticker size (10cm x 15cm)
+        - 🔢 QR code for each part (Part No, Qty, Delivery Location, Storage Location)
+        - 📍 Location tracking
+        - 🏷️ Model box — models detected directly from your data, Include/Exclude toggle
+        - 📦 Quantity per bin/vehicle
         """)
 
-        st.subheader("💡 Tips")
+    with info_col2:
         st.markdown("""
-        - Use clear column headers like "Part No", "Description", "Location"
-        - Bus model labels are read straight from your file — "7M", "9M", "12M", or any
-          other model names your fleet uses; nothing is hardcoded
-        - Include quantity information in "Qty/Bin" or "Qty/Veh" columns
-        - Location strings will be automatically parsed into components
-        - Clients that don't use bus models at all can simply pick **"Exclude"** in the sidebar
+        **Supported Columns:**
+        - Part Number/Part No
+        - Description/Name
+        - Location/Position
+        - Qty/Bin, Quantity
+        - Qty/Veh, Qty per Vehicle
+        - Model/Product Type
+        - Store Location
         """)
 
-        st.subheader("📊 Sample Data Format")
-        sample_data = pd.DataFrame({
-            'Part No': ['ABC123', 'DEF456', 'GHI789'],
-            'Description': ['Engine Filter', 'Brake Pad Set', 'Oil Filter'],
-            'Location': ['A1_B2_C3', 'D4_E5_F6', 'G7_H8_I9'],
-            'Qty/Bin': [5, 10, 8],
-            'Qty/Veh': [2, 4, 1],
-            'Bus Model': ['9M', '12M', '7M']
-        })
-        st.dataframe(sample_data, use_container_width=True)
+
+def _render_bulk_instructions():
+    st.subheader("📋 Instructions")
+    st.markdown("""
+    1. **Choose Include or Exclude** for the Model Box in the sidebar
+    2. **Download the blank template** (optional) and fill it in with your data
+    3. **Upload your file** - Excel (.xlsx, .xls) or CSV format
+    4. **Review data preview** - Check if your data looks correct
+    5. **Verify column detection** - Ensure columns are properly identified
+    6. **Generate labels** - Click the button to create your PDF
+    7. **Download** - Get your professional sticker labels
+    """)
+
+    st.subheader("💡 Tips")
+    st.markdown("""
+    - Use clear column headers like "Part No", "Description", "Location"
+    - Model labels are read straight from your file — "7M", "9M", "12M", "Type-A", or any
+      other model names your product line uses; nothing is hardcoded
+    - Include quantity information in "Qty/Bin" or "Qty/Veh" columns
+    - Location strings will be automatically parsed into components
+    - Clients that don't use models at all can simply pick **"Exclude"** in the sidebar
+    - Only need 1 or 2 labels? Switch to **"Manual entry"** above instead of uploading a file
+    """)
+
+
+def _render_sample_data():
+    st.subheader("📊 Sample Data Format")
+    sample_data = pd.DataFrame({
+        'Part No': ['ABC123', 'DEF456', 'GHI789'],
+        'Description': ['Engine Filter', 'Brake Pad Set', 'Oil Filter'],
+        'Location': ['A1_B2_C3', 'D4_E5_F6', 'G7_H8_I9'],
+        'Qty/Bin': [5, 10, 8],
+        'Qty/Veh': [2, 4, 1],
+        'Model': ['9M', '12M', '7M']
+    })
+    st.dataframe(sample_data, use_container_width=True)
 
 
 if __name__ == "__main__":
