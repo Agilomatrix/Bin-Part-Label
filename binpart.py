@@ -23,6 +23,9 @@ STICKER_PAGESIZE = (STICKER_WIDTH, STICKER_HEIGHT)
 CONTENT_BOX_WIDTH = 10 * cm  # Same width as page
 CONTENT_BOX_HEIGHT = 7.2 * cm  # Half the page height
 
+# Max number of "Store Loc N" columns we will ever look for in a file
+MAX_STORE_LOC_CELLS = 9
+
 # Check for PIL and install if needed
 try:
     from PIL import Image as PILImage
@@ -229,8 +232,12 @@ def generate_qr_code(data_string):
 
 
 def parse_location_string(location_str):
-    """Parse a location string into components for table display"""
-    location_parts = [''] * 7
+    """
+    Parse a location string into components for table display.
+    Line Location now has 6 cells (Rack No 1st+2nd digit were merged into
+    a single "Rack No" cell), so this returns 6 parts instead of 7.
+    """
+    location_parts = [''] * 6
 
     if not location_str or not isinstance(location_str, str):
         return location_parts
@@ -239,19 +246,36 @@ def parse_location_string(location_str):
     if location_str.lower() in ['nan', 'none', 'null']:
         return location_parts
 
-    import re
     pattern = r'([^_\s]+)'
     matches = re.findall(pattern, location_str)
 
-    for i, match in enumerate(matches[:7]):
+    for i, match in enumerate(matches[:6]):
         if match.lower() not in ['nan', 'none', 'null']:
             location_parts[i] = match
 
     return location_parts
 
 
+def _clean_digit_value(v):
+    """Small helper: turn '1.0' -> '1', strip blanks/NaN-like strings to ''."""
+    if v is None:
+        return ''
+    v = str(v).strip()
+    if not v or v.lower() in ['nan', 'none', 'null']:
+        return ''
+    if re.match(r'^\d+\.0$', v):
+        v = str(int(float(v)))
+    return v
+
+
 def extract_location_data_from_excel(row_data):
-    """Extract location data from Excel row for Line Location"""
+    """
+    Extract location data from Excel row for Line Location.
+
+    Rack No (1st digit) and Rack No (2nd digit) are combined into a single
+    "Rack No" cell here, so Line Location is now 6 cells instead of 7:
+    Bus Model, Station No, Rack, Rack No, Level, Cell.
+    """
     available_cols = list(row_data.index) if hasattr(row_data, 'index') else []
 
     def find_column_value(possible_names, default=''):
@@ -273,33 +297,67 @@ def extract_location_data_from_excel(row_data):
     level = find_column_value(['Level', 'LEVEL', 'level'])
     cell = find_column_value(['Cell', 'CELL', 'cell'])
 
-    return [bus_model, station_no, rack, rack_no_1st, rack_no_2nd, level, cell]
+    d1 = _clean_digit_value(rack_no_1st)
+    d2 = _clean_digit_value(rack_no_2nd)
+    rack_no = f"{d1}{d2}" if (d1 or d2) else ''
+
+    return [bus_model, station_no, rack, rack_no, level, cell]
 
 
-def extract_store_location_data_from_excel(row_data):
-    """Extract store location data from Excel row for Store Location"""
-    def get_clean_value(possible_names, default=''):
-        for name in possible_names:
-            if name in row_data:
-                val = row_data[name]
-                if pd.notna(val) and str(val).lower() not in ['nan', 'none', 'null', '']:
-                    return str(val).strip()
-            for col in row_data.index:
-                if isinstance(col, str) and col.upper() == name.upper():
-                    val = row_data[col]
-                    if pd.notna(val) and str(val).lower() not in ['nan', 'none', 'null', '']:
-                        return str(val).strip()
-        return default
+def get_store_loc_column_count(df, max_cells=MAX_STORE_LOC_CELLS):
+    """
+    Scan the file's columns ONCE (whole file, not per-row) and return how
+    many sequential 'Store Loc N' columns (N = 1..max_cells) are present.
+    Every label generated from this file uses this same cell count, e.g.
+    if the file only has "Store Loc 1".."Store Loc 6" then every label's
+    Store Location box has 6 cells; if it has up to "Store Loc 9" it has 9.
+    Returns 0 if no "Store Loc N" columns are found at all.
+    """
+    cols_upper = set()
+    for c in df.columns:
+        key = str(c).upper().replace('_', ' ').strip()
+        key = re.sub(r'\s+', ' ', key)
+        cols_upper.add(key)
 
-    station_name = get_clean_value(['Station Name', 'STATION NAME', 'Station_Name', 'STATIONNAME'], '')
-    store_location = get_clean_value(['Store Location', 'STORE LOCATION', 'Store_Location', 'STORELOCATION'], '')
-    zone = get_clean_value(['ABB ZONE', 'ABB_ZONE', 'ABBZONE'], '')
-    location = get_clean_value(['ABB LOCATION', 'ABB_LOCATION', 'ABBLOCATION'], '')
-    floor = get_clean_value(['ABB FLOOR', 'ABB_FLOOR', 'ABBFLOOR'], '')
-    rack_no = get_clean_value(['ABB RACK NO', 'ABB_RACK_NO', 'ABBRACKNO'], '')
-    level_in_rack = get_clean_value(['ABB LEVEL IN RACK', 'ABB_LEVEL_IN_RACK', 'ABBLEVELINRACK'], '')
+    count = 0
+    for i in range(1, max_cells + 1):
+        candidates = {f'STORE LOC {i}', f'STORELOC{i}', f'STORE LOC{i}'}
+        if candidates & cols_upper:
+            count = i
+        else:
+            # Stop at the first gap so the numbering stays sequential
+            # (e.g. "Store Loc 1" + "Store Loc 3" with no "Store Loc 2"
+            # is treated as just 1 cell).
+            break
+    return count
 
-    return [station_name, store_location, zone, location, floor, rack_no, level_in_rack]
+
+def extract_store_location_data_from_excel(row_data, num_cells):
+    """
+    Extract Store Location values from the generic 'Store Loc 1' ..
+    'Store Loc N' columns (N = num_cells, detected once per file via
+    get_store_loc_column_count). Always returns a list of exactly
+    num_cells values so every label in the batch has the same width;
+    a cell is '' if this particular row has no value for it.
+    """
+    values = []
+    col_map = {}
+    for k in row_data.index:
+        key = str(k).upper().replace('_', ' ').strip()
+        key = re.sub(r'\s+', ' ', key)
+        col_map[key] = k
+
+    for i in range(1, num_cells + 1):
+        candidates = [f'STORE LOC {i}', f'STORELOC{i}', f'STORE LOC{i}']
+        val = ''
+        for cand in candidates:
+            if cand in col_map:
+                raw = row_data[col_map[cand]]
+                if pd.notna(raw) and str(raw).strip().lower() not in ['nan', 'none', 'null', '']:
+                    val = _clean_digit_value(raw)
+                break
+        values.append(val)
+    return values
 
 
 def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=None, include_mtm_box=True):
@@ -310,6 +368,14 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
     that don't use it at all. The model labels themselves (e.g. 7M, 9M,
     12M, or whatever a given client's fleet uses) are always detected
     directly from the uploaded file - nothing is hardcoded.
+
+    Line Location is 6 cells: Bus Model, Station No, Rack, Rack No
+    (1st+2nd digit merged), Level, Cell.
+
+    Store Location is dynamic: it reads "Store Loc 1".."Store Loc N"
+    columns straight from the uploaded file (N auto-detected, up to
+    MAX_STORE_LOC_CELLS), so a file with only "Store Loc 1".."Store Loc 6"
+    prints 6 cells and a file with up to "Store Loc 9" prints 9 cells.
     """
     def log(msg):
         if status_callback:
@@ -406,6 +472,18 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
     else:
         log("Bus Model Box: Exclude -> no bus-model box will be printed")
 
+    # ---- Resolve the Store Location box width once for the whole file ----
+    num_store_cells = get_store_loc_column_count(df, max_cells=MAX_STORE_LOC_CELLS)
+    if num_store_cells == 0:
+        log("⚠️ No 'Store Loc N' columns detected in file — Store Location box "
+            "will print with a single empty cell.")
+        num_store_cells = 1
+    else:
+        log(f"Store Location: detected {num_store_cells} cell(s) "
+            f"(Store Loc 1..{num_store_cells}) in this file")
+
+    store_font_size = 9 if num_store_cells <= 6 else (8 if num_store_cells <= 8 else 7)
+
     # Create document with minimal margins
     doc = SimpleDocTemplate(output_pdf_path, pagesize=STICKER_PAGESIZE,
                           topMargin=0.2*cm,
@@ -431,6 +509,16 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
         )
     else:
         log("⚠️ Sorting skipped: could not find all rack-related columns.")
+
+    # Layout for the Line Location table (6 cells): Bus Model, Station No,
+    # Rack, Rack No (merged), Level, Cell.
+    inner_table_width = content_width * 2 / 3
+    line_col_proportions = [1.8, 2.4, 0.7, 1.4, 0.7, 0.9]
+    line_total_proportion = sum(line_col_proportions)
+    line_inner_col_widths = [w * inner_table_width / line_total_proportion for w in line_col_proportions]
+
+    # Layout for the Store Location table: num_store_cells equal-width cells.
+    store_inner_col_widths = [inner_table_width / num_store_cells] * num_store_cells
 
     # Process each row as a single sticker
     total_rows = len(df)
@@ -489,22 +577,16 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
 
         elements.append(main_table)
 
-        # Store Location section
+        # Store Location section (dynamic Store Loc 1..N cells)
         store_loc_label = Paragraph("Store Location", ParagraphStyle(
         name='StoreLoc', fontName='Helvetica-Bold', fontSize=11, alignment=TA_CENTER
         ))
-        inner_table_width = content_width * 2 / 3
 
-        col_proportions = [1.8, 2.4, 0.7, 0.7, 0.7, 0.7, 0.9]
-        total_proportion = sum(col_proportions)
-
-        inner_col_widths = [w * inner_table_width / total_proportion for w in col_proportions]
-
-        store_loc_values = extract_store_location_data_from_excel(row)
+        store_loc_values = extract_store_location_data_from_excel(row, num_store_cells)
 
         store_loc_inner_table = Table(
             [store_loc_values],
-            colWidths=inner_col_widths,
+            colWidths=store_inner_col_widths,
             rowHeights=[location_row_height]
         )
         store_loc_inner_table.setStyle(TableStyle([
@@ -512,7 +594,7 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
             ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('FONTSIZE', (0, 0), (-1, -1), store_font_size),
         ]))
         store_loc_table = Table(
             [[store_loc_label, store_loc_inner_table]],
@@ -526,18 +608,14 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
         ]))
         elements.append(store_loc_table)
 
-        # Line Location section
+        # Line Location section (6 cells - Rack No 1st+2nd merged)
         line_loc_label = Paragraph("Line Location", ParagraphStyle(
             name='LineLoc', fontName='Helvetica-Bold', fontSize=11, alignment=TA_CENTER
         ))
         location_parts = extract_location_data_from_excel(row)
-        location_parts = [
-            str(int(float(val))) if isinstance(val, str) and re.match(r'^\d+\.0$', val) else val
-            for val in location_parts
-        ]
         line_loc_inner_table = Table(
             [location_parts],
-            colWidths=inner_col_widths,
+            colWidths=line_inner_col_widths,
             rowHeights=[location_row_height]
         )
         line_loc_inner_table.setStyle(TableStyle([
@@ -773,6 +851,18 @@ def main():
                 else:
                     st.warning("🚌 Include is selected, but no bus-model data was found in this file — the box won't be printed.")
 
+            # Show how many Store Location cells were detected in this file
+            df_store_check = df_full.copy()
+            df_store_check.columns = [c.upper() if isinstance(c, str) else c for c in df_store_check.columns]
+            store_cell_count = get_store_loc_column_count(df_store_check, max_cells=MAX_STORE_LOC_CELLS)
+            if store_cell_count:
+                st.success(f"📦 Store Location: detected {store_cell_count} cell(s) "
+                           f"(Store Loc 1..{store_cell_count}) in this file")
+            else:
+                st.warning("📦 No 'Store Loc N' columns detected — the Store Location box "
+                           "will print with a single empty cell. Add columns named "
+                           "'Store Loc 1', 'Store Loc 2', ... to fill it in.")
+
         except Exception as e:
             st.error(f"Error analyzing columns: {e}")
             return
@@ -850,7 +940,8 @@ def main():
             **Label Features:**
             - 📏 Standard sticker size (10cm x 15cm)
             - 🔢 QR code for each part (Part No, Qty, Delivery Location, Storage Location)
-            - 📍 Location tracking
+            - 📍 Line Location (6 cells: Bus Model, Station No, Rack, Rack No, Level, Cell)
+            - 📦 Store Location (dynamic: Store Loc 1..N, N auto-detected per file, up to 9)
             - 🚌 Bus model box — models detected directly from your file, Include/Exclude toggle
             - 📦 Quantity per bin/vehicle
             """)
@@ -864,7 +955,8 @@ def main():
             - Qty/Bin, Quantity
             - Qty/Veh, Qty per Vehicle
             - Bus Model/Vehicle Type
-            - Store Location
+            - Rack No (1st digit) / Rack No (2nd digit) — merged into one Line Location cell
+            - Store Loc 1, Store Loc 2, ... Store Loc 9 — as many as your fleet needs
             """)
 
     else:
@@ -885,8 +977,12 @@ def main():
         - Use clear column headers like "Part No", "Description", "Location"
         - Bus model labels are read straight from your file — "7M", "9M", "12M", or any
           other model names your fleet uses; nothing is hardcoded
+        - **Line Location** has 6 cells: Bus Model, Station No, Rack, Rack No (this
+          merges "Rack No (1st digit)" and "Rack No (2nd digit)" into one cell), Level, Cell
+        - **Store Location** is dynamic: add columns named "Store Loc 1", "Store Loc 2",
+          up to "Store Loc 9" — the label only prints as many cells as your file actually has
+          (e.g. only "Store Loc 1".."Store Loc 6" in the file -> a 6-cell box)
         - Include quantity information in "Qty/Bin" or "Qty/Veh" columns
-        - Location strings will be automatically parsed into components
         - Clients that don't use bus models at all can simply pick **"Exclude"** in the sidebar
         """)
 
@@ -897,7 +993,12 @@ def main():
             'Location': ['A1_B2_C3', 'D4_E5_F6', 'G7_H8_I9'],
             'Qty/Bin': [5, 10, 8],
             'Qty/Veh': [2, 4, 1],
-            'Bus Model': ['9M', '12M', '7M']
+            'Bus Model': ['9M', '12M', '7M'],
+            'Rack No (1st digit)': [1, 0, 2],
+            'Rack No (2nd digit)': [2, 5, 1],
+            'Store Loc 1': ['A', 'B', 'C'],
+            'Store Loc 2': ['01', '02', '03'],
+            'Store Loc 3': ['3', '', '5'],
         })
         st.dataframe(sample_data, use_container_width=True)
 
