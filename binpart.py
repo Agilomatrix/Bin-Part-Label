@@ -25,9 +25,12 @@ CONTENT_BOX_HEIGHT = 7.2 * cm  # Half the page height
 
 # Columns used for the manual-entry / mastersheet-template workflow
 TEMPLATE_COLUMNS = [
-    'Part No', 'Description', 'Location', 'Qty/Bin', 'Qty/Veh', 'Model', 'Store Location',
-    'Station No', 'Rack', 'Rack No (1st digit)', 'Rack No (2nd digit)', 'Level', 'Cell',
-    'Station Name', 'ABB ZONE', 'ABB LOCATION', 'ABB FLOOR', 'ABB RACK NO', 'ABB LEVEL IN RACK'
+    'Part No', 'Description', 'Location', 'Qty/Bin', 'Qty/Veh', 'Model',
+    'Station No', 'Storage Type', 'Rack No', 'Level', 'Cell',
+    'Store Location',
+    'Store Location 1', 'Store Location 2', 'Store Location 3', 'Store Location 4',
+    'Store Location 5', 'Store Location 6', 'Store Location 7', 'Store Location 8',
+    'Store Location 9',
 ]
 
 # Check for PIL and install if needed
@@ -64,6 +67,39 @@ except ImportError:
 bold_style = ParagraphStyle(name='Bold', fontName='Helvetica-Bold', fontSize=16, alignment=TA_CENTER, leading=14)
 desc_style = ParagraphStyle(name='Description', fontName='Helvetica', fontSize=11, alignment=TA_CENTER, leading=12)
 qty_style = ParagraphStyle(name='Quantity', fontName='Helvetica', fontSize=11, alignment=TA_CENTER, leading=12)
+
+
+def _autosize_cell(text, base_font_size=9, min_font_size=5):
+    """
+    Build a centered, bold Paragraph for a small table cell that auto-wraps
+    and shrinks its font size as the text gets longer, so values of any
+    length still fit inside the fixed-width location/store/model boxes.
+    wordWrap='CJK' lets it break mid-word (not just at spaces), which
+    matters for location codes that don't contain spaces.
+    """
+    text = '' if text is None else str(text).strip()
+    length = len(text)
+    if length <= 5:
+        font_size = base_font_size
+    elif length <= 8:
+        font_size = base_font_size - 1
+    elif length <= 12:
+        font_size = base_font_size - 2
+    elif length <= 18:
+        font_size = base_font_size - 3
+    else:
+        font_size = min_font_size
+    font_size = max(min_font_size, font_size)
+
+    style = ParagraphStyle(
+        name=f'AutoFit_{length}_{font_size}',
+        fontName='Helvetica-Bold',
+        fontSize=font_size,
+        leading=font_size + 1,
+        alignment=TA_CENTER,
+        wordWrap='CJK'
+    )
+    return Paragraph(text, style)
 
 
 def find_model_column(df_columns):
@@ -275,7 +311,17 @@ def parse_location_string(location_str):
 
 
 def extract_location_data_from_excel(row_data):
-    """Extract location data from Excel row for Line Location"""
+    """
+    Extract the 6 'Line Location' values, in this order:
+    Station No, Storage Type/Rack, Rack No (1st digit), Rack No (2nd digit),
+    Level, Cell.
+
+    Supports both the newer mastersheet layout (Station No / Storage Type /
+    Rack No / Level / Cell) and the older layout that already split Rack No
+    into two separate digit columns. If only a single combined "Rack No"
+    column is present, it's split into two digits automatically so the two
+    rack-digit slots still get filled.
+    """
     available_cols = list(row_data.index) if hasattr(row_data, 'index') else []
 
     def find_column_value(possible_names, default=''):
@@ -289,19 +335,72 @@ def extract_location_data_from_excel(row_data):
                     return str(val) if pd.notna(val) and str(val).lower() != 'nan' else default
         return default
 
-    model = find_column_value(['Model', 'MODEL', 'Bus Model', 'Bus model', 'BUS MODEL', 'BUSMODEL', 'Bus_Model'])
-    station_no = find_column_value(['Station No', 'Station no', 'STATION NO', 'STATIONNO', 'Station_No'])
-    rack = find_column_value(['Rack', 'RACK', 'rack'])
+    station_no = find_column_value(['Station No', 'STATION NO', 'Station_No', 'STATIONNO'])
+    storage_type = find_column_value(['Storage Type', 'STORAGE TYPE', 'Storage_Type', 'Rack', 'RACK'])
+
     rack_no_1st = find_column_value(['Rack No (1st digit)', 'RACK NO (1st digit)', 'Rack_No_1st', 'RACK_NO_1ST'])
     rack_no_2nd = find_column_value(['Rack No (2nd digit)', 'RACK NO (2nd digit)', 'Rack_No_2nd', 'RACK_NO_2ND'])
+
+    if not rack_no_1st and not rack_no_2nd:
+        rack_no_combined = find_column_value(['Rack No', 'RACK NO', 'Rack_No', 'RACKNO'])
+        if rack_no_combined:
+            digits = re.sub(r'\D', '', rack_no_combined)
+            if len(digits) >= 2:
+                rack_no_1st, rack_no_2nd = digits[0], digits[1:]
+            elif len(digits) == 1:
+                rack_no_1st, rack_no_2nd = digits, ''
+            else:
+                rack_no_1st, rack_no_2nd = rack_no_combined, ''
+
     level = find_column_value(['Level', 'LEVEL', 'level'])
     cell = find_column_value(['Cell', 'CELL', 'cell'])
 
-    return [model, station_no, rack, rack_no_1st, rack_no_2nd, level, cell]
+    return [station_no, storage_type, rack_no_1st, rack_no_2nd, level, cell]
+
+
+def detect_store_location_columns(df, max_cells=9):
+    """
+    Find numbered store-location columns like 'Store Location 1' ...
+    'Store Location 9' (also matches 'Store Loc 1', 'STORE_LOCATION_1',
+    etc.), returned in numeric order. This is what lets the Store Location
+    box on the label automatically adapt to however many cells a given
+    mastersheet actually has (up to max_cells), instead of a hardcoded 7.
+    """
+    found = {}
+    for col in df.columns:
+        if not isinstance(col, str):
+            continue
+        compact = re.sub(r'[^A-Z0-9]', '', col.upper())
+        m = re.match(r'^STORELOC(?:ATION)?(\d+)$', compact)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= max_cells:
+                found[n] = col
+    return [found[n] for n in sorted(found.keys())]
+
+
+def extract_store_location_values(row, store_loc_cols):
+    """Pull the value for each detected 'Store Location N' column for this row."""
+    values = []
+    for col in store_loc_cols:
+        val = row[col] if col in row else None
+        if pd.notna(val) and str(val).strip().lower() not in ['nan', 'none', 'null', '']:
+            v = str(val).strip()
+            if re.match(r'^\d+\.0$', v):
+                v = str(int(float(v)))
+            values.append(v)
+        else:
+            values.append('')
+    return values
 
 
 def extract_store_location_data_from_excel(row_data):
-    """Extract store location data from Excel row for Store Location"""
+    """
+    Legacy ABB-style Store Location extraction (Station Name, Store
+    Location, Zone, Location, Floor, Rack No, Level in Rack). Kept as a
+    fallback for older mastersheets that don't use the numbered
+    'Store Location 1..9' columns.
+    """
     def get_clean_value(possible_names, default=''):
         for name in possible_names:
             if name in row_data:
@@ -339,19 +438,21 @@ def create_blank_mastersheet_bytes():
         'Qty/Bin': 5,
         'Qty/Veh': 2,
         'Model': '9M',
+        'Station No': 'ST-10',
+        'Storage Type': 'SH',
+        'Rack No': 1,
+        'Level': 'A',
+        'Cell': 1,
         'Store Location': 'Main Store',
-        'Station No': '',
-        'Rack': '',
-        'Rack No (1st digit)': '',
-        'Rack No (2nd digit)': '',
-        'Level': '',
-        'Cell': '',
-        'Station Name': '',
-        'ABB ZONE': '',
-        'ABB LOCATION': '',
-        'ABB FLOOR': '',
-        'ABB RACK NO': '',
-        'ABB LEVEL IN RACK': ''
+        'Store Location 1': '',
+        'Store Location 2': '',
+        'Store Location 3': '',
+        'Store Location 4': '',
+        'Store Location 5': '',
+        'Store Location 6': '',
+        'Store Location 7': '',
+        'Store Location 8': '',
+        'Store Location 9': '',
     }
     template_df = pd.DataFrame([example_row], columns=TEMPLATE_COLUMNS)
 
@@ -419,8 +520,10 @@ def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, incl
 
     qty_veh_col = next((col for col in cols if any(term in col for term in ['QTY/VEH', 'QTY_VEH', 'QTY PER VEH', 'QTYVEH', 'QTYPERCAR', 'QTYCAR', 'QTY/CAR'])), None)
 
-    store_loc_col = next((col for col in cols if 'STORE' in col and 'LOC' in col),
-                      next((col for col in cols if 'STORELOCATION' in col), None))
+    # Generic single-value "Store Location" column (used for QR data).
+    # Exclude numbered variants ("Store Location 1", etc.) so they don't
+    # get mistaken for this one.
+    store_loc_col = next((col for col in cols if 'STORE' in col and 'LOC' in col and not re.search(r'\d', col)), None)
 
     # NOTE: must detect against the already-uppercased column names (cols),
     # not the original-case ones - df's own columns were just upper-cased
@@ -449,6 +552,16 @@ def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, incl
     else:
         log("Model Box: Exclude -> no model box will be printed")
 
+    # ---- Resolve the Store Location box: numbered columns 1..9, else legacy ----
+    store_loc_cols = detect_store_location_columns(df, max_cells=9)
+    use_legacy_store_loc = not store_loc_cols
+    if use_legacy_store_loc:
+        log("Store Location: no numbered 'Store Location N' columns found - using legacy fields")
+        store_cell_count = 7
+    else:
+        log(f"Store Location: found {len(store_loc_cols)} cell(s) -> {', '.join(store_loc_cols)}")
+        store_cell_count = len(store_loc_cols)
+
     # Create document with minimal margins
     doc = SimpleDocTemplate(output_pdf_path, pagesize=STICKER_PAGESIZE,
                           topMargin=0.2*cm,
@@ -456,6 +569,14 @@ def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, incl
                           leftMargin=0.1*cm, rightMargin=0.1*cm)
 
     content_width = CONTENT_BOX_WIDTH - 0.2*cm
+    inner_table_width = content_width * 2 / 3
+
+    # 6 fixed cells for Line Location: Station No, Storage Type/Rack,
+    # Rack No (1st digit), Rack No (2nd digit), Level, Cell.
+    line_col_widths = [inner_table_width / 6] * 6
+    # Store Location adapts to however many cells were detected.
+    store_col_widths = [inner_table_width / store_cell_count] * store_cell_count
+
     all_elements = []
 
     # Sorting by rack columns if present
@@ -532,30 +653,27 @@ def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, incl
 
         elements.append(main_table)
 
-        # Store Location section
+        # ---- Store Location section (auto-adapts to N detected cells) ----
         store_loc_label = Paragraph("Store Location", ParagraphStyle(
         name='StoreLoc', fontName='Helvetica-Bold', fontSize=11, alignment=TA_CENTER
         ))
-        inner_table_width = content_width * 2 / 3
 
-        col_proportions = [1.8, 2.4, 0.7, 0.7, 0.7, 0.7, 0.9]
-        total_proportion = sum(col_proportions)
+        if use_legacy_store_loc:
+            store_loc_values_raw = extract_store_location_data_from_excel(row)
+        else:
+            store_loc_values_raw = extract_store_location_values(row, store_loc_cols)
 
-        inner_col_widths = [w * inner_table_width / total_proportion for w in col_proportions]
-
-        store_loc_values = extract_store_location_data_from_excel(row)
+        store_loc_values = [_autosize_cell(v) for v in store_loc_values_raw]
 
         store_loc_inner_table = Table(
             [store_loc_values],
-            colWidths=inner_col_widths,
+            colWidths=store_col_widths,
             rowHeights=[location_row_height]
         )
         store_loc_inner_table.setStyle(TableStyle([
             ('GRID', (0, 0), (-1, -1), 1.2, colors.Color(0, 0, 0, alpha=0.95)),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
         ]))
         store_loc_table = Table(
             [[store_loc_label, store_loc_inner_table]],
@@ -569,26 +687,26 @@ def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, incl
         ]))
         elements.append(store_loc_table)
 
-        # Line Location section
+        # ---- Line Location section (fixed 6 cells: Station No -> Cell) ----
         line_loc_label = Paragraph("Line Location", ParagraphStyle(
             name='LineLoc', fontName='Helvetica-Bold', fontSize=11, alignment=TA_CENTER
         ))
-        location_parts = extract_location_data_from_excel(row)
-        location_parts = [
+        location_parts_raw = extract_location_data_from_excel(row)
+        location_parts_raw = [
             str(int(float(val))) if isinstance(val, str) and re.match(r'^\d+\.0$', val) else val
-            for val in location_parts
+            for val in location_parts_raw
         ]
+        location_parts = [_autosize_cell(v) for v in location_parts_raw]
+
         line_loc_inner_table = Table(
             [location_parts],
-            colWidths=inner_col_widths,
+            colWidths=line_col_widths,
             rowHeights=[location_row_height]
         )
         line_loc_inner_table.setStyle(TableStyle([
             ('GRID', (0, 0), (-1, -1), 1.2, colors.Color(0, 0, 0, alpha=0.95)),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 9)
         ]))
         line_loc_table = Table(
             [[line_loc_label, line_loc_inner_table]],
@@ -639,11 +757,9 @@ def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, incl
             model_box_width = reserved_area_width / n_models
             model_box_width = max(0.65*cm, min(1.4*cm, model_box_width))
 
-            header_row = list(all_models)
+            header_row = [_autosize_cell(model, base_font_size=9, min_font_size=6) for model in all_models]
             value_row = [
-                Paragraph(f"<b>{model_quantities[model]}</b>", ParagraphStyle(
-                    name=f'BoldModel_{model}', fontName='Helvetica-Bold', fontSize=9, alignment=TA_CENTER
-                )) if model_quantities[model] else ""
+                _autosize_cell(model_quantities[model], base_font_size=9, min_font_size=6) if model_quantities[model] else ""
                 for model in all_models
             ]
 
@@ -657,9 +773,6 @@ def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, incl
                 ('GRID', (0, 0), (-1, -1), 1.2, colors.Color(0, 0, 0, alpha=0.95)),
                 ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
                 ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 8 if n_models > 4 else 9),
-                ('FONTSIZE', (0, 1), (-1, 1), 9),
             ]))
 
             model_table_width = model_box_width * n_models
@@ -746,6 +859,12 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
 
 
 LOGO_FILENAME = "agilomatrix_logo.png"
+# Resolve the logo relative to THIS script's folder rather than the
+# process's current working directory - on Streamlit Cloud the working
+# directory isn't always the same folder the script lives in, which is why
+# the logo could silently fail to show even though the file was present in
+# the repo.
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), LOGO_FILENAME)
 
 CUSTOM_CSS = """
 <style>
@@ -859,8 +978,7 @@ def dataframe_to_manual_labels(df):
     loc_col = next((col for col in cols if 'LOC' in col or 'POS' in col or 'LOCATION' in col),
                    cols[2] if len(cols) > 2 else desc_col)
     qty_veh_col = next((col for col in cols if any(term in col for term in ['QTY/VEH', 'QTY_VEH', 'QTY PER VEH', 'QTYVEH', 'QTYPERCAR', 'QTYCAR', 'QTY/CAR'])), None)
-    store_loc_col = next((col for col in cols if 'STORE' in col and 'LOC' in col),
-                      next((col for col in cols if 'STORELOCATION' in col), None))
+    store_loc_col = next((col for col in cols if 'STORE' in col and 'LOC' in col and not re.search(r'\d', col)), None)
     model_col = find_model_column(cols)
 
     def clean(val):
@@ -886,9 +1004,59 @@ def dataframe_to_manual_labels(df):
     return rows
 
 
+def dataframe_to_extra_fields(df):
+    """
+    Preserve any mastersheet columns that AREN'T part of the basic
+    manual-entry fields above - e.g. Station No, Storage Type, Rack No,
+    Level, Cell, Store Location 1..9 - so they can still reach the PDF
+    generator even though the manual-entry grid doesn't have boxes for
+    them. Returned as one dict of {ORIGINAL_COLUMN_NAME: value} per row,
+    aligned by row index with dataframe_to_manual_labels()'s output.
+    """
+    if df is None or len(df) == 0:
+        return []
+
+    work_df = df.copy()
+    work_df.columns = [col.upper() if isinstance(col, str) else col for col in work_df.columns]
+    cols = work_df.columns.tolist()
+    if not cols:
+        return []
+
+    part_no_col = next((col for col in cols if 'PART' in col and ('NO' in col or 'NUM' in col or '#' in col)),
+                   next((col for col in cols if col in ['PARTNO', 'PART']), cols[0]))
+    desc_col = next((col for col in cols if 'DESC' in col),
+                   next((col for col in cols if 'NAME' in col), cols[1] if len(cols) > 1 else part_no_col))
+    qty_bin_col = next((col for col in cols if 'QTY/BIN' in col or 'QTY_BIN' in col or 'QTYBIN' in col),
+                  next((col for col in cols if 'QTY' in col and 'BIN' in col), None))
+    if not qty_bin_col:
+        qty_bin_col = next((col for col in cols if 'QTY' in col),
+                      next((col for col in cols if 'QUANTITY' in col), None))
+    loc_col = next((col for col in cols if 'LOC' in col or 'POS' in col or 'LOCATION' in col),
+                   cols[2] if len(cols) > 2 else desc_col)
+    qty_veh_col = next((col for col in cols if any(term in col for term in ['QTY/VEH', 'QTY_VEH', 'QTY PER VEH', 'QTYVEH', 'QTYPERCAR', 'QTYCAR', 'QTY/CAR'])), None)
+    store_loc_col = next((col for col in cols if 'STORE' in col and 'LOC' in col and not re.search(r'\d', col)), None)
+    model_col = find_model_column(cols)
+
+    basic_cols = {c for c in [part_no_col, desc_col, qty_bin_col, loc_col, qty_veh_col, store_loc_col, model_col] if c}
+
+    extra_rows = []
+    for _, row in work_df.iterrows():
+        extra = {}
+        for col in cols:
+            if col in basic_cols:
+                continue
+            val = row[col]
+            if pd.notna(val):
+                extra[col] = val
+        extra_rows.append(extra)
+    return extra_rows
+
+
 def _init_session_state():
     if 'manual_labels' not in st.session_state:
         st.session_state.manual_labels = [{}]
+    if 'manual_labels_extra' not in st.session_state:
+        st.session_state.manual_labels_extra = [{}]
     if 'last_prefill_signature' not in st.session_state:
         st.session_state.last_prefill_signature = None
 
@@ -936,8 +1104,10 @@ def _render_sidebar():
                     prefill_df = pd.read_excel(uploaded_prefill)
 
                 new_rows = dataframe_to_manual_labels(prefill_df)
+                new_extra = dataframe_to_extra_fields(prefill_df)
                 if new_rows:
                     st.session_state.manual_labels = new_rows
+                    st.session_state.manual_labels_extra = new_extra
                     st.session_state.last_prefill_signature = signature
                     st.sidebar.success(f"✅ Loaded {len(new_rows)} label(s) from {uploaded_prefill.name}")
                     st.rerun()
@@ -958,10 +1128,10 @@ def _render_sidebar():
 
 
 def _render_header():
-    if os.path.exists(LOGO_FILENAME):
+    if os.path.exists(LOGO_PATH):
         logo_col = st.columns([1, 1.4, 1])[1]
         with logo_col:
-            st.image(LOGO_FILENAME, use_container_width=True)
+            st.image(LOGO_PATH, use_container_width=True)
 
     st.markdown("<div class='agilo-title'>Bin Label Generator</div>", unsafe_allow_html=True)
     st.markdown("<div class='agilo-subtitle'>PART BIN LABEL GENERATOR</div>", unsafe_allow_html=True)
@@ -983,6 +1153,13 @@ def _render_labels_section():
         unsafe_allow_html=True
     )
 
+    # Keep the "extra" (uploaded-only) fields in sync in length with
+    # manual_labels, in case rows were added/removed by hand.
+    while len(st.session_state.manual_labels_extra) < len(st.session_state.manual_labels):
+        st.session_state.manual_labels_extra.append({})
+    while len(st.session_state.manual_labels_extra) > len(st.session_state.manual_labels):
+        st.session_state.manual_labels_extra.pop()
+
     to_remove = None
     for i, label in enumerate(st.session_state.manual_labels):
         with st.container(border=True):
@@ -999,27 +1176,35 @@ def _render_labels_section():
     if to_remove is not None:
         if len(st.session_state.manual_labels) > 1:
             st.session_state.manual_labels.pop(to_remove)
+            st.session_state.manual_labels_extra.pop(to_remove)
         else:
             st.session_state.manual_labels[0] = {}
+            st.session_state.manual_labels_extra[0] = {}
         st.rerun()
 
     if st.button("+ Add label"):
         st.session_state.manual_labels.append({})
+        st.session_state.manual_labels_extra.append({})
         st.rerun()
 
-    return [
-        {
-            'Part No': label.get('part_no', ''),
-            'Description': label.get('description', ''),
-            'Model': label.get('model', ''),
-            'Location': label.get('location', ''),
-            'Qty/Bin': label.get('qty_bin', ''),
-            'Qty/Veh': label.get('qty_veh', ''),
-            'Store Location': label.get('store_location', ''),
-        }
-        for label in st.session_state.manual_labels
-        if any(str(v).strip() for v in label.values())
-    ]
+    result = []
+    for label, extra in zip(st.session_state.manual_labels, st.session_state.manual_labels_extra):
+        if any(str(v).strip() for v in label.values()):
+            row = {
+                'Part No': label.get('part_no', ''),
+                'Description': label.get('description', ''),
+                'Model': label.get('model', ''),
+                'Location': label.get('location', ''),
+                'Qty/Bin': label.get('qty_bin', ''),
+                'Qty/Veh': label.get('qty_veh', ''),
+                'Store Location': label.get('store_location', ''),
+            }
+            # Carry through any detailed mastersheet columns (Station No,
+            # Storage Type, Rack No, Level, Cell, Store Location 1-9, etc.)
+            # that came from an uploaded file but aren't shown in the grid.
+            row.update(extra)
+            result.append(row)
+    return result
 
 
 def _render_generate_section(rows, include_model_box):
@@ -1093,7 +1278,8 @@ def _render_help_sections():
             **Label Features:**
             - 📏 Standard sticker size (10cm x 15cm)
             - 🔢 QR code for each part (Part No, Qty, Delivery Location, Storage Location)
-            - 📍 Location tracking
+            - 📍 Line Location: Station No, Storage Type, Rack No, Level, Cell
+            - 🗄️ Store Location: auto-detects "Store Location 1..9" columns
             - 🏷️ Model box — models detected directly from your data, Include/Exclude toggle
             - 📦 Quantity per bin/vehicle
             """)
@@ -1103,6 +1289,8 @@ def _render_help_sections():
             **Tips:**
             - Model labels are read straight from your data — "7M", "9M", "12M",
               "Type-A", or any other model names your product line uses; nothing is hardcoded
+            - Store Location cells scale automatically to however many
+              "Store Location N" columns your mastersheet has (up to 9)
             - Clients that don't use models at all can pick **"Exclude"** in the sidebar
             - Only need 1-2 labels? Just fill in the blanks below — no file needed
             - Have many parts? Upload a mastersheet in the sidebar to prefill everything at once
@@ -1112,10 +1300,14 @@ def _render_help_sections():
         sample_data = pd.DataFrame({
             'Part No': ['ABC123', 'DEF456', 'GHI789'],
             'Description': ['Engine Filter', 'Brake Pad Set', 'Oil Filter'],
-            'Location': ['A1_B2_C3', 'D4_E5_F6', 'G7_H8_I9'],
+            'Model': ['9M', '12M', '7M'],
+            'Station No': ['ST-10', 'ST-11', 'ST-12'],
+            'Storage Type': ['SH', 'SH', 'SH'],
+            'Rack No': [1, 2, 3],
+            'Level': ['A', 'B', 'A'],
+            'Cell': [1, 2, 3],
             'Qty/Bin': [5, 10, 8],
             'Qty/Veh': [2, 4, 1],
-            'Model': ['9M', '12M', '7M']
         })
         st.dataframe(sample_data, use_container_width=True)
 
