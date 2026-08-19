@@ -268,91 +268,105 @@ def _clean_digit_value(v):
     return v
 
 
+def _norm_key(name):
+    """
+    Normalize a column header for matching: uppercase and strip out ALL
+    spaces/underscores, so 'Store Location 1', 'STORE_LOCATION_1' and
+    'StoreLocation1' are all treated as the same key. This is what lets
+    column detection survive real-world header formatting differences.
+    """
+    return re.sub(r'[\s_]+', '', str(name).upper().strip())
+
+
+def _get_val_by_names(row_data, possible_names, default=''):
+    """
+    Look up a value in a row by trying a list of possible header names,
+    matched via _norm_key (so spacing/underscore differences don't matter).
+    Returns the cleaned string value, or default if not found/blank.
+    """
+    norm_map = {}
+    for k in row_data.index:
+        norm_map[_norm_key(k)] = k
+    for name in possible_names:
+        nk = _norm_key(name)
+        if nk in norm_map:
+            val = row_data[norm_map[nk]]
+            if pd.notna(val) and str(val).strip().lower() not in ['nan', 'none', 'null', '']:
+                return _clean_digit_value(val)
+    return default
+
+
 def extract_location_data_from_excel(row_data):
     """
-    Extract location data from Excel row for Line Location.
+    Extract location data from Excel row for Line Location (6 cells):
+    Model, Station No, Storage Type, Rack No, Level, Cell.
 
-    Rack No (1st digit) and Rack No (2nd digit) are combined into a single
-    "Rack No" cell here, so Line Location is now 6 cells instead of 7:
-    Bus Model, Station No, Rack, Rack No, Level, Cell.
+    Column matching is flexible (case/space/underscore-insensitive), so it
+    works against headers like "MODEL", "STORAGE TYPE", "RACK NO" as-is.
+    If a file instead has the older split "Rack No (1st digit)" / "Rack No
+    (2nd digit)" columns, those are automatically merged into one Rack No
+    value for backward compatibility.
     """
-    available_cols = list(row_data.index) if hasattr(row_data, 'index') else []
+    model = _get_val_by_names(row_data, ['Bus Model', 'Model', 'Vehicle Model', 'Vehicle Type'])
+    station_no = _get_val_by_names(row_data, ['Station No'])
+    storage_type = _get_val_by_names(row_data, ['Storage Type', 'Rack Type', 'Rack'])
 
-    def find_column_value(possible_names, default=''):
-        for name in possible_names:
-            if name in row_data:
-                val = row_data[name]
-                return str(val) if pd.notna(val) and str(val).lower() != 'nan' else default
-            for col in available_cols:
-                if isinstance(col, str) and col.upper() == name.upper():
-                    val = row_data[col]
-                    return str(val) if pd.notna(val) and str(val).lower() != 'nan' else default
-        return default
+    rack_no = _get_val_by_names(row_data, ['Rack No', 'RackNo'])
+    if not rack_no:
+        d1 = _get_val_by_names(row_data, ['Rack No (1st digit)', 'Rack No 1st digit'])
+        d2 = _get_val_by_names(row_data, ['Rack No (2nd digit)', 'Rack No 2nd digit'])
+        rack_no = f"{d1}{d2}" if (d1 or d2) else ''
 
-    bus_model = find_column_value(['Bus Model', 'Bus model', 'BUS MODEL', 'BUSMODEL', 'Bus_Model'])
-    station_no = find_column_value(['Station No', 'Station no', 'STATION NO', 'STATIONNO', 'Station_No'])
-    rack = find_column_value(['Rack', 'RACK', 'rack'])
-    rack_no_1st = find_column_value(['Rack No (1st digit)', 'RACK NO (1st digit)', 'Rack_No_1st', 'RACK_NO_1ST'])
-    rack_no_2nd = find_column_value(['Rack No (2nd digit)', 'RACK NO (2nd digit)', 'Rack_No_2nd', 'RACK_NO_2ND'])
-    level = find_column_value(['Level', 'LEVEL', 'level'])
-    cell = find_column_value(['Cell', 'CELL', 'cell'])
+    level = _get_val_by_names(row_data, ['Level'])
+    cell = _get_val_by_names(row_data, ['Cell'])
 
-    d1 = _clean_digit_value(rack_no_1st)
-    d2 = _clean_digit_value(rack_no_2nd)
-    rack_no = f"{d1}{d2}" if (d1 or d2) else ''
-
-    return [bus_model, station_no, rack, rack_no, level, cell]
+    return [model, station_no, storage_type, rack_no, level, cell]
 
 
 def get_store_loc_column_count(df, max_cells=MAX_STORE_LOC_CELLS):
     """
     Scan the file's columns ONCE (whole file, not per-row) and return how
-    many sequential 'Store Loc N' columns (N = 1..max_cells) are present.
+    many sequential store-location columns (N = 1..max_cells) are present.
+    Matches BOTH naming styles - "Store Loc N" and "Store Location N" -
+    regardless of spacing/underscores (e.g. "Store Location 1",
+    "STORE_LOC_1", "StoreLocation1" all count).
     Every label generated from this file uses this same cell count, e.g.
-    if the file only has "Store Loc 1".."Store Loc 6" then every label's
-    Store Location box has 6 cells; if it has up to "Store Loc 9" it has 9.
-    Returns 0 if no "Store Loc N" columns are found at all.
+    if the file only has "Store Location 1".."Store Location 6" then every
+    label's Store Location box has 6 cells; up to 9 gives 9 cells.
+    Returns 0 if no matching columns are found at all.
     """
-    cols_upper = set()
-    for c in df.columns:
-        key = str(c).upper().replace('_', ' ').strip()
-        key = re.sub(r'\s+', ' ', key)
-        cols_upper.add(key)
+    norm_cols = {_norm_key(c) for c in df.columns}
 
     count = 0
     for i in range(1, max_cells + 1):
-        candidates = {f'STORE LOC {i}', f'STORELOC{i}', f'STORE LOC{i}'}
-        if candidates & cols_upper:
+        candidates = {f'STORELOC{i}', f'STORELOCATION{i}'}
+        if candidates & norm_cols:
             count = i
         else:
             # Stop at the first gap so the numbering stays sequential
-            # (e.g. "Store Loc 1" + "Store Loc 3" with no "Store Loc 2"
-            # is treated as just 1 cell).
+            # (e.g. "Store Location 1" + "Store Location 3" with no
+            # "Store Location 2" is treated as just 1 cell).
             break
     return count
 
 
 def extract_store_location_data_from_excel(row_data, num_cells):
     """
-    Extract Store Location values from the generic 'Store Loc 1' ..
-    'Store Loc N' columns (N = num_cells, detected once per file via
+    Extract Store Location values from the generic 'Store Loc N' /
+    'Store Location N' columns (N = num_cells, detected once per file via
     get_store_loc_column_count). Always returns a list of exactly
     num_cells values so every label in the batch has the same width;
     a cell is '' if this particular row has no value for it.
     """
-    values = []
-    col_map = {}
-    for k in row_data.index:
-        key = str(k).upper().replace('_', ' ').strip()
-        key = re.sub(r'\s+', ' ', key)
-        col_map[key] = k
+    norm_map = {_norm_key(k): k for k in row_data.index}
 
+    values = []
     for i in range(1, num_cells + 1):
-        candidates = [f'STORE LOC {i}', f'STORELOC{i}', f'STORE LOC{i}']
+        candidates = [f'STORELOC{i}', f'STORELOCATION{i}']
         val = ''
         for cand in candidates:
-            if cand in col_map:
-                raw = row_data[col_map[cand]]
+            if cand in norm_map:
+                raw = row_data[norm_map[cand]]
                 if pd.notna(raw) and str(raw).strip().lower() not in ['nan', 'none', 'null', '']:
                     val = _clean_digit_value(raw)
                 break
@@ -369,13 +383,14 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
     12M, or whatever a given client's fleet uses) are always detected
     directly from the uploaded file - nothing is hardcoded.
 
-    Line Location is 6 cells: Bus Model, Station No, Rack, Rack No
-    (1st+2nd digit merged), Level, Cell.
+    Line Location is 6 cells: Model, Station No, Storage Type, Rack No,
+    Level, Cell - matched flexibly against your headers (e.g. "MODEL",
+    "STORAGE TYPE", "RACK NO" all work as-is).
 
-    Store Location is dynamic: it reads "Store Loc 1".."Store Loc N"
+    Store Location is dynamic: it reads "Store Loc N" / "Store Location N"
     columns straight from the uploaded file (N auto-detected, up to
-    MAX_STORE_LOC_CELLS), so a file with only "Store Loc 1".."Store Loc 6"
-    prints 6 cells and a file with up to "Store Loc 9" prints 9 cells.
+    MAX_STORE_LOC_CELLS), so a file with only 3 such columns prints 3
+    cells and a file with up to 9 prints 9 cells.
     """
     def log(msg):
         if status_callback:
@@ -475,12 +490,12 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
     # ---- Resolve the Store Location box width once for the whole file ----
     num_store_cells = get_store_loc_column_count(df, max_cells=MAX_STORE_LOC_CELLS)
     if num_store_cells == 0:
-        log("⚠️ No 'Store Loc N' columns detected in file — Store Location box "
-            "will print with a single empty cell.")
+        log("⚠️ No 'Store Loc N' / 'Store Location N' columns detected in file — "
+            "Store Location box will print with a single empty cell.")
         num_store_cells = 1
     else:
         log(f"Store Location: detected {num_store_cells} cell(s) "
-            f"(Store Loc 1..{num_store_cells}) in this file")
+            f"(Store Location 1..{num_store_cells}) in this file")
 
     store_font_size = 9 if num_store_cells <= 6 else (8 if num_store_cells <= 8 else 7)
 
@@ -510,8 +525,8 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
     else:
         log("⚠️ Sorting skipped: could not find all rack-related columns.")
 
-    # Layout for the Line Location table (6 cells): Bus Model, Station No,
-    # Rack, Rack No (merged), Level, Cell.
+    # Layout for the Line Location table (6 cells): Model, Station No,
+    # Storage Type, Rack No, Level, Cell.
     inner_table_width = content_width * 2 / 3
     line_col_proportions = [1.8, 2.4, 0.7, 1.4, 0.7, 0.9]
     line_total_proportion = sum(line_col_proportions)
@@ -857,11 +872,12 @@ def main():
             store_cell_count = get_store_loc_column_count(df_store_check, max_cells=MAX_STORE_LOC_CELLS)
             if store_cell_count:
                 st.success(f"📦 Store Location: detected {store_cell_count} cell(s) "
-                           f"(Store Loc 1..{store_cell_count}) in this file")
+                           f"(Store Location 1..{store_cell_count}) in this file")
             else:
-                st.warning("📦 No 'Store Loc N' columns detected — the Store Location box "
-                           "will print with a single empty cell. Add columns named "
-                           "'Store Loc 1', 'Store Loc 2', ... to fill it in.")
+                st.warning("📦 No 'Store Loc N' / 'Store Location N' columns detected — the "
+                           "Store Location box will print with a single empty cell. Add "
+                           "columns named 'Store Location 1', 'Store Location 2', ... "
+                           "to fill it in.")
 
         except Exception as e:
             st.error(f"Error analyzing columns: {e}")
@@ -940,8 +956,8 @@ def main():
             **Label Features:**
             - 📏 Standard sticker size (10cm x 15cm)
             - 🔢 QR code for each part (Part No, Qty, Delivery Location, Storage Location)
-            - 📍 Line Location (6 cells: Bus Model, Station No, Rack, Rack No, Level, Cell)
-            - 📦 Store Location (dynamic: Store Loc 1..N, N auto-detected per file, up to 9)
+            - 📍 Line Location (6 cells: Model, Station No, Storage Type, Rack No, Level, Cell)
+            - 📦 Store Location (dynamic: Store Location 1..N, N auto-detected per file, up to 9)
             - 🚌 Bus model box — models detected directly from your file, Include/Exclude toggle
             - 📦 Quantity per bin/vehicle
             """)
@@ -954,9 +970,9 @@ def main():
             - Location/Position
             - Qty/Bin, Quantity
             - Qty/Veh, Qty per Vehicle
-            - Bus Model/Vehicle Type
-            - Rack No (1st digit) / Rack No (2nd digit) — merged into one Line Location cell
-            - Store Loc 1, Store Loc 2, ... Store Loc 9 — as many as your fleet needs
+            - Model/Bus Model/Vehicle Type
+            - Storage Type, Rack No (single column — or the older split "Rack No (1st/2nd digit)" still works)
+            - Store Location 1, Store Location 2, ... Store Location 9 — as many as your fleet needs
             """)
 
     else:
@@ -977,11 +993,14 @@ def main():
         - Use clear column headers like "Part No", "Description", "Location"
         - Bus model labels are read straight from your file — "7M", "9M", "12M", or any
           other model names your fleet uses; nothing is hardcoded
-        - **Line Location** has 6 cells: Bus Model, Station No, Rack, Rack No (this
-          merges "Rack No (1st digit)" and "Rack No (2nd digit)" into one cell), Level, Cell
-        - **Store Location** is dynamic: add columns named "Store Loc 1", "Store Loc 2",
-          up to "Store Loc 9" — the label only prints as many cells as your file actually has
-          (e.g. only "Store Loc 1".."Store Loc 6" in the file -> a 6-cell box)
+        - **Line Location** has 6 cells: Model, Station No, Storage Type, Rack No, Level, Cell
+          (column matching ignores case/spacing, so "MODEL", "STORAGE TYPE" etc. all work as-is;
+          an older file with split "Rack No (1st digit)"/"Rack No (2nd digit)" columns still
+          auto-merges into one Rack No cell)
+        - **Store Location** is dynamic: add columns named "Store Location 1", "Store Location 2",
+          up to "Store Location 9" (or "Store Loc 1", "Store Loc 2"... — both styles work) — the
+          label only prints as many cells as your file actually has (e.g. only 3 such columns
+          in the file -> a 3-cell box)
         - Include quantity information in "Qty/Bin" or "Qty/Veh" columns
         - Clients that don't use bus models at all can simply pick **"Exclude"** in the sidebar
         """)
@@ -990,15 +1009,17 @@ def main():
         sample_data = pd.DataFrame({
             'Part No': ['ABC123', 'DEF456', 'GHI789'],
             'Description': ['Engine Filter', 'Brake Pad Set', 'Oil Filter'],
-            'Location': ['A1_B2_C3', 'D4_E5_F6', 'G7_H8_I9'],
             'Qty/Bin': [5, 10, 8],
             'Qty/Veh': [2, 4, 1],
-            'Bus Model': ['9M', '12M', '7M'],
-            'Rack No (1st digit)': [1, 0, 2],
-            'Rack No (2nd digit)': [2, 5, 1],
-            'Store Loc 1': ['A', 'B', 'C'],
-            'Store Loc 2': ['01', '02', '03'],
-            'Store Loc 3': ['3', '', '5'],
+            'Model': ['9M', '12M', '7M'],
+            'Station No': ['ST-10', 'ST-10', 'ST-11'],
+            'Storage Type': ['SH', 'SH', 'FL'],
+            'Rack No': [12, 5, 21],
+            'Level': ['A', 'B', 'A'],
+            'Cell': [1, 3, 2],
+            'Store Location 1': ['A', 'B', 'C'],
+            'Store Location 2': ['01', '02', '03'],
+            'Store Location 3': ['3', '', '5'],
         })
         st.dataframe(sample_data, use_container_width=True)
 
