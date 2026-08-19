@@ -528,7 +528,7 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
     # Layout for the Line Location table (6 cells): Model, Station No,
     # Storage Type, Rack No, Level, Cell.
     inner_table_width = content_width * 2 / 3
-    line_col_proportions = [1.8, 2.4, 1.0, 1.1, 0.7, 0.9]
+    line_col_proportions = [1.8, 2.4, 0.7, 1.4, 0.7, 0.9]
     line_total_proportion = sum(line_col_proportions)
     line_inner_col_widths = [w * inner_table_width / line_total_proportion for w in line_col_proportions]
 
@@ -757,21 +757,89 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
         return None
 
 
+LOGO_CANDIDATE_PATHS = [
+    "agilomatrix_logo.png",
+    "logo.png",
+    "assets/agilomatrix_logo.png",
+    "assets/logo.png",
+    "images/agilomatrix_logo.png",
+    "static/agilomatrix_logo.png",
+]
+
+
+def _find_logo_path():
+    """
+    Locate the Agilomatrix logo file already sitting in the repo.
+    Checks a few common locations/filenames; if your logo lives somewhere
+    else, just add its path to LOGO_CANDIDATE_PATHS above.
+    """
+    for path in LOGO_CANDIDATE_PATHS:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def build_blank_template_bytes():
+    """
+    Build a blank Bin Label Master Sheet template (headers only, a couple
+    of example Store Location columns) as XLSX bytes, for the
+    "Download blank mastersheet template" button.
+    """
+    columns = [
+        'Part No', 'Description', 'Qty/Bin', 'Qty/Veh',
+        'Model', 'Station No', 'Storage Type', 'Rack No', 'Level', 'Cell',
+        'Store Location 1', 'Store Location 2', 'Store Location 3',
+    ]
+    template_df = pd.DataFrame(columns=columns)
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        template_df.to_excel(writer, index=False, sheet_name='Master Sheet')
+    buf.seek(0)
+    return buf.getvalue()
+
+
 def main():
     """Main Streamlit application"""
     st.set_page_config(page_title="Bin Label Generator", page_icon="🏷️", layout="wide")
 
-    st.title("🏷️ Bin Label Generator")
-    st.markdown(
-        "<p style='font-size:18px; font-style:italic; margin-top:-10px; text-align:left;'>"
-        "Designed and Developed by Agilomatrix</p>",
-        unsafe_allow_html=True
-    )
+    # ---- Shared style tweaks (gradient divider + tagline styling) ----
+    st.markdown("""
+        <style>
+        .agilo-tagline {
+            text-align: center;
+            font-size: 19px;
+            letter-spacing: 0.06em;
+            color: #475569;
+            font-weight: 600;
+            margin-top: -6px;
+        }
+        .agilo-gradient-bar {
+            height: 4px;
+            width: 340px;
+            max-width: 60%;
+            margin: 18px auto 26px auto;
+            border-radius: 2px;
+            background: linear-gradient(to right, #3B82F6 0%, #10B981 33%, #EC4899 66%, #F97316 100%);
+        }
+        .agilo-subtext {
+            text-align: center;
+            color: #64748B;
+            font-size: 16px;
+            max-width: 760px;
+            margin: 0 auto;
+        }
+        .agilo-credit {
+            text-align: center;
+            font-style: italic;
+            color: #94A3B8;
+            font-size: 14px;
+            margin-top: 6px;
+        }
+        </style>
+    """, unsafe_allow_html=True)
 
-    st.markdown("---")
-
-    # Sidebar for configuration
-    st.sidebar.header("Configuration")
+    # ---- Sidebar: Settings ----
+    st.sidebar.header("Settings")
 
     st.sidebar.subheader("Bus Model Box")
     mtm_choice = st.sidebar.radio(
@@ -787,13 +855,44 @@ def main():
     )
     include_mtm_box = (mtm_choice == "Include")
 
-    # File upload
-    st.header("📁 File Upload")
-    uploaded_file = st.file_uploader(
-        "Choose an Excel or CSV file",
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Optional: upload to prefill")
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload mastersheet (.XLSX)",
         type=['xlsx', 'xls', 'csv'],
-        help="Upload your Excel or CSV file containing part information"
+        help="200MB per file • XLSX / XLS / CSV",
+        label_visibility="collapsed",
     )
+
+    st.sidebar.download_button(
+        label="Download blank mastersheet template",
+        data=build_blank_template_bytes(),
+        file_name="Bin_Label_Master_Sheet_Template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+    # ---- Main header: logo, title, tagline, gradient bar, blurb ----
+    header_l, header_c, header_r = st.columns([1, 2, 1])
+    with header_c:
+        logo_path = _find_logo_path()
+        if logo_path:
+            st.image(logo_path, use_container_width=True)
+        st.markdown("<h1 style='text-align:center; margin-bottom:0;'>🏷️ Bin Label Generator</h1>",
+                    unsafe_allow_html=True)
+        st.markdown("<div class='agilo-tagline'>STICKER LABEL GENERATOR</div>", unsafe_allow_html=True)
+        st.markdown("<div class='agilo-gradient-bar'></div>", unsafe_allow_html=True)
+        st.markdown(
+            "<p class='agilo-subtext'>Upload your Bin Label Master Sheet in the sidebar to "
+            "bulk-generate part stickers — each with a QR code, Line Location and Store "
+            "Location boxes, and an optional bus-model box, all detected straight from "
+            "your file. No spreadsheet to wrangle by hand.</p>",
+            unsafe_allow_html=True
+        )
+        st.markdown("<p class='agilo-credit'>Designed and Developed by Agilomatrix</p>",
+                    unsafe_allow_html=True)
+
+    st.markdown("---")
 
     if uploaded_file is not None:
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
