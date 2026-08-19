@@ -528,7 +528,7 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
     # Layout for the Line Location table (6 cells): Model, Station No,
     # Storage Type, Rack No, Level, Cell.
     inner_table_width = content_width * 2 / 3
-    line_col_proportions = [1.8, 2.4, 0.7, 1.4, 0.7, 0.9]
+    line_col_proportions = [1.8, 2.4, 1.0, 1.1, 0.7, 0.9]
     line_total_proportion = sum(line_col_proportions)
     line_inner_col_widths = [w * inner_table_width / line_total_proportion for w in line_col_proportions]
 
