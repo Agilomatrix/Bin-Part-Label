@@ -899,7 +899,9 @@ def main():
     with header_c:
         logo_path = _find_logo_path()
         if logo_path:
-            st.image(logo_path, use_container_width=True)
+            logo_l, logo_mid, logo_r = st.columns([1, 1, 1])
+            with logo_mid:
+                st.image(logo_path, width=180)
         st.markdown("<h1 style='text-align:center; margin-bottom:0;'>🏷️ Bin Label Generator</h1>",
                     unsafe_allow_html=True)
         st.markdown("<div class='agilo-tagline'>STICKER LABEL GENERATOR</div>", unsafe_allow_html=True)
