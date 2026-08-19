@@ -69,30 +69,35 @@ desc_style = ParagraphStyle(name='Description', fontName='Helvetica', fontSize=1
 qty_style = ParagraphStyle(name='Quantity', fontName='Helvetica', fontSize=11, alignment=TA_CENTER, leading=12)
 
 
-def _autosize_cell(text, base_font_size=9, min_font_size=5):
+def _autosize_cell(text, col_width_pt=56, base_font_size=9, min_font_size=5):
     """
-    Build a centered, bold Paragraph for a small table cell that auto-wraps
-    and shrinks its font size as the text gets longer, so values of any
-    length still fit inside the fixed-width location/store/model boxes.
-    wordWrap='CJK' lets it break mid-word (not just at spaces), which
-    matters for location codes that don't contain spaces.
+    Build a centered, bold Paragraph for a small table cell that shrinks its
+    font size to fit the actual cell width before it ever needs to wrap, and
+    only wraps (wordWrap='CJK', breaks mid-word too) as a last resort once
+    it has hit the minimum font size. col_width_pt is the cell's width in
+    points (reportlab's cm/inch constants already convert to points, so
+    values like store_col_widths[i] can be passed straight through).
+
+    Narrower cells (e.g. a 9-cell Store Location row) will therefore shrink
+    text more readily than wider ones (e.g. a 6-cell Line Location row),
+    because they're judged against their own real width, not a fixed
+    character-count guess.
     """
     text = '' if text is None else str(text).strip()
-    length = len(text)
-    if length <= 5:
-        font_size = base_font_size
-    elif length <= 8:
-        font_size = base_font_size - 1
-    elif length <= 12:
-        font_size = base_font_size - 2
-    elif length <= 18:
-        font_size = base_font_size - 3
-    else:
-        font_size = min_font_size
-    font_size = max(min_font_size, font_size)
+    if not text:
+        return ''
+
+    usable_pt = max(col_width_pt - 4, 10)  # leave a little padding
+    font_size = base_font_size
+    while font_size > min_font_size:
+        avg_char_width = font_size * 0.62  # approx for Helvetica-Bold
+        max_chars = usable_pt / avg_char_width
+        if len(text) <= max_chars:
+            break
+        font_size -= 1
 
     style = ParagraphStyle(
-        name=f'AutoFit_{length}_{font_size}',
+        name=f'AutoFit_{len(text)}_{font_size}_{int(col_width_pt)}',
         fontName='Helvetica-Bold',
         fontSize=font_size,
         leading=font_size + 1,
@@ -394,6 +399,18 @@ def extract_store_location_values(row, store_loc_cols):
     return values
 
 
+def has_legacy_abb_columns(df):
+    """
+    True only if the file genuinely has the old ABB-style store-location
+    columns (Station Name / ABB Zone / ABB Location / ABB Floor / ABB Rack
+    No / ABB Level in Rack). Used to decide whether the legacy 7-field
+    fallback is real data or would just be 7 empty boxes.
+    """
+    markers = ['STATION NAME', 'ABB ZONE', 'ABB LOCATION', 'ABB FLOOR', 'ABB RACK NO', 'ABB LEVEL IN RACK']
+    cols_upper = {str(c).upper() for c in df.columns if isinstance(c, str)}
+    return any(marker in cols_upper for marker in markers)
+
+
 def extract_store_location_data_from_excel(row_data):
     """
     Legacy ABB-style Store Location extraction (Station Name, Store
@@ -552,15 +569,29 @@ def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, incl
     else:
         log("Model Box: Exclude -> no model box will be printed")
 
-    # ---- Resolve the Store Location box: numbered columns 1..9, else legacy ----
+    # ---- Resolve the Store Location box: exactly as many cells as the file
+    # actually has - never a fixed/padded number. Priority order:
+    #   1. Numbered "Store Location N" columns -> exactly that many cells
+    #   2. Legacy ABB-style columns, only if genuinely present -> 7 cells
+    #   3. A single generic "Store Location" column -> 1 cell
+    #   4. Nothing found -> 0 cells (box prints with no inner grid)
     store_loc_cols = detect_store_location_columns(df, max_cells=9)
-    use_legacy_store_loc = not store_loc_cols
-    if use_legacy_store_loc:
-        log("Store Location: no numbered 'Store Location N' columns found - using legacy fields")
-        store_cell_count = 7
-    else:
-        log(f"Store Location: found {len(store_loc_cols)} cell(s) -> {', '.join(store_loc_cols)}")
+    if store_loc_cols:
+        store_loc_mode = 'numbered'
         store_cell_count = len(store_loc_cols)
+        log(f"Store Location: {store_cell_count} cell(s) detected -> {', '.join(store_loc_cols)}")
+    elif has_legacy_abb_columns(df):
+        store_loc_mode = 'legacy'
+        store_cell_count = 7
+        log("Store Location: using legacy ABB-style fields (7 cells)")
+    elif store_loc_col:
+        store_loc_mode = 'single'
+        store_cell_count = 1
+        log(f"Store Location: single column detected -> {store_loc_col} (1 cell)")
+    else:
+        store_loc_mode = 'none'
+        store_cell_count = 0
+        log("Store Location: no store-location data found in this file - box will be empty")
 
     # Create document with minimal margins
     doc = SimpleDocTemplate(output_pdf_path, pagesize=STICKER_PAGESIZE,
@@ -574,8 +605,9 @@ def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, incl
     # 6 fixed cells for Line Location: Station No, Storage Type/Rack,
     # Rack No (1st digit), Rack No (2nd digit), Level, Cell.
     line_col_widths = [inner_table_width / 6] * 6
-    # Store Location adapts to however many cells were detected.
-    store_col_widths = [inner_table_width / store_cell_count] * store_cell_count
+    # Store Location adapts to however many cells were detected (0 is
+    # possible - handled below by simply not rendering a nested grid).
+    store_col_widths = [inner_table_width / store_cell_count] * store_cell_count if store_cell_count else []
 
     all_elements = []
 
@@ -653,32 +685,47 @@ def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, incl
 
         elements.append(main_table)
 
-        # ---- Store Location section (auto-adapts to N detected cells) ----
+        # ---- Store Location section (exactly as many cells as detected) ----
         store_loc_label = Paragraph("Store Location", ParagraphStyle(
         name='StoreLoc', fontName='Helvetica-Bold', fontSize=11, alignment=TA_CENTER
         ))
 
-        if use_legacy_store_loc:
-            store_loc_values_raw = extract_store_location_data_from_excel(row)
-        else:
+        if store_loc_mode == 'numbered':
             store_loc_values_raw = extract_store_location_values(row, store_loc_cols)
+        elif store_loc_mode == 'legacy':
+            store_loc_values_raw = extract_store_location_data_from_excel(row)
+        elif store_loc_mode == 'single':
+            raw_val = row[store_loc_col] if store_loc_col in row else None
+            store_loc_values_raw = [str(raw_val).strip()] if pd.notna(raw_val) else ['']
+        else:
+            store_loc_values_raw = []
 
-        store_loc_values = [_autosize_cell(v) for v in store_loc_values_raw]
+        if store_loc_values_raw:
+            store_loc_values = [
+                _autosize_cell(v, col_width_pt=store_col_widths[i]) for i, v in enumerate(store_loc_values_raw)
+            ]
+            store_loc_inner_table = Table(
+                [store_loc_values],
+                colWidths=store_col_widths
+                # No fixed rowHeights - let the row grow automatically if a
+                # value has to wrap, instead of overlapping the row below.
+            )
+            store_loc_inner_table.setStyle(TableStyle([
+                ('GRID', (0, 0), (-1, -1), 1.2, colors.Color(0, 0, 0, alpha=0.95)),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ]))
+        else:
+            # Nothing to show - keep a single blank cell so the row still
+            # has a visible border, without pretending there's data.
+            store_loc_inner_table = Table([['']], colWidths=[inner_table_width])
+            store_loc_inner_table.setStyle(TableStyle([
+                ('GRID', (0, 0), (-1, -1), 1.2, colors.Color(0, 0, 0, alpha=0.95)),
+            ]))
 
-        store_loc_inner_table = Table(
-            [store_loc_values],
-            colWidths=store_col_widths,
-            rowHeights=[location_row_height]
-        )
-        store_loc_inner_table.setStyle(TableStyle([
-            ('GRID', (0, 0), (-1, -1), 1.2, colors.Color(0, 0, 0, alpha=0.95)),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ]))
         store_loc_table = Table(
             [[store_loc_label, store_loc_inner_table]],
-            colWidths=[content_width/3, inner_table_width],
-            rowHeights=[location_row_height]
+            colWidths=[content_width/3, inner_table_width]
         )
         store_loc_table.setStyle(TableStyle([
             ('GRID', (0, 0), (-1, -1), 1.2, colors.Color(0, 0, 0, alpha=0.95)),
@@ -696,12 +743,14 @@ def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, incl
             str(int(float(val))) if isinstance(val, str) and re.match(r'^\d+\.0$', val) else val
             for val in location_parts_raw
         ]
-        location_parts = [_autosize_cell(v) for v in location_parts_raw]
+        location_parts = [
+            _autosize_cell(v, col_width_pt=line_col_widths[i]) for i, v in enumerate(location_parts_raw)
+        ]
 
         line_loc_inner_table = Table(
             [location_parts],
-            colWidths=line_col_widths,
-            rowHeights=[location_row_height]
+            colWidths=line_col_widths
+            # No fixed rowHeights here either, for the same reason.
         )
         line_loc_inner_table.setStyle(TableStyle([
             ('GRID', (0, 0), (-1, -1), 1.2, colors.Color(0, 0, 0, alpha=0.95)),
@@ -710,8 +759,7 @@ def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, incl
         ]))
         line_loc_table = Table(
             [[line_loc_label, line_loc_inner_table]],
-            colWidths=[content_width/3, inner_table_width],
-            rowHeights=[location_row_height]
+            colWidths=[content_width/3, inner_table_width]
         )
         line_loc_table.setStyle(TableStyle([
             ('GRID', (0, 0), (-1, -1), 1.2, colors.Color(0, 0, 0, alpha=0.95)),
@@ -757,16 +805,17 @@ def generate_sticker_labels_core(df, output_pdf_path, status_callback=None, incl
             model_box_width = reserved_area_width / n_models
             model_box_width = max(0.65*cm, min(1.4*cm, model_box_width))
 
-            header_row = [_autosize_cell(model, base_font_size=9, min_font_size=6) for model in all_models]
+            header_row = [_autosize_cell(model, col_width_pt=model_box_width, min_font_size=6) for model in all_models]
             value_row = [
-                _autosize_cell(model_quantities[model], base_font_size=9, min_font_size=6) if model_quantities[model] else ""
+                _autosize_cell(model_quantities[model], col_width_pt=model_box_width, min_font_size=6) if model_quantities[model] else ""
                 for model in all_models
             ]
 
             model_table = Table(
                 [header_row, value_row],
-                colWidths=[model_box_width] * n_models,
-                rowHeights=[model_row_height/2, model_row_height/2]
+                colWidths=[model_box_width] * n_models
+                # No fixed rowHeights - same overlap-avoidance reasoning as
+                # the Store/Line Location tables above.
             )
 
             model_table.setStyle(TableStyle([
