@@ -878,7 +878,7 @@ def main():
     include_mtm_box = (mtm_choice == "Include")
 
     st.sidebar.markdown("---")
-    st.sidebar.subheader("Optional: upload to prefill")
+    st.sidebar.subheader("Upload the Mastersheet")
     uploaded_file = st.sidebar.file_uploader(
         "Upload mastersheet (.XLSX)",
         type=['xlsx', 'xls', 'csv'],
