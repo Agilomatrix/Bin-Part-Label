@@ -758,10 +758,15 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
 
 
 LOGO_CANDIDATE_PATHS = [
+    "Agilomatrix logo.png",
     "agilomatrix_logo.png",
+    "agilomatrix logo.png",
+    "Agilomatrix_logo.png",
     "logo.png",
+    "assets/Agilomatrix logo.png",
     "assets/agilomatrix_logo.png",
     "assets/logo.png",
+    "images/Agilomatrix logo.png",
     "images/agilomatrix_logo.png",
     "static/agilomatrix_logo.png",
 ]
@@ -770,12 +775,29 @@ LOGO_CANDIDATE_PATHS = [
 def _find_logo_path():
     """
     Locate the Agilomatrix logo file already sitting in the repo.
-    Checks a few common locations/filenames; if your logo lives somewhere
-    else, just add its path to LOGO_CANDIDATE_PATHS above.
+    First tries the exact candidate paths above (fast path). If none of
+    those match - e.g. the repo file has different spacing/casing, like
+    "Agilomatrix logo.png" - falls back to scanning the app's folder (and
+    a few common subfolders) for any image file whose name contains
+    "logo", case-insensitively, so small naming differences don't break it.
     """
     for path in LOGO_CANDIDATE_PATHS:
         if os.path.exists(path):
             return path
+
+    search_dirs = [".", "assets", "images", "static"]
+    image_exts = (".png", ".jpg", ".jpeg", ".webp")
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for fname in os.listdir(d):
+                lower = fname.lower()
+                if "logo" in lower and lower.endswith(image_exts):
+                    return os.path.join(d, fname)
+        except OSError:
+            continue
+
     return None
 
 
