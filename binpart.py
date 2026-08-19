@@ -745,27 +745,163 @@ def generate_sticker_labels(excel_file_path, output_pdf_path, status_callback=No
                                          include_model_box=include_model_box)
 
 
-def main():
-    """Main Streamlit application"""
-    st.set_page_config(page_title="Bin Label Generator", page_icon="🏷️", layout="wide")
+LOGO_FILENAME = "agilomatrix_logo.png"
 
-    st.title("🏷️ Bin Label Generator")
-    st.markdown(
-        "<p style='font-size:18px; font-style:italic; margin-top:-10px; text-align:left;'>"
-        "Designed and Developed by Agilomatrix</p>",
-        unsafe_allow_html=True
-    )
+CUSTOM_CSS = """
+<style>
+.agilo-title {
+    text-align: center;
+    font-size: 44px;
+    font-weight: 800;
+    color: #16264a;
+    margin-top: 6px;
+    margin-bottom: 2px;
+}
+.agilo-subtitle {
+    text-align: center;
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    color: #8a94a6;
+    margin-bottom: 20px;
+}
+.agilo-gradient-bar {
+    height: 5px;
+    width: 42%;
+    min-width: 220px;
+    margin: 0 auto 26px auto;
+    border-radius: 3px;
+    background: linear-gradient(to right, #4a90e2, #34c759, #e91e8c, #f5a623);
+}
+.agilo-desc {
+    text-align: center;
+    color: #5a6472;
+    font-size: 15.5px;
+    line-height: 1.6;
+    max-width: 780px;
+    margin: 0 auto 30px auto;
+}
+.agilo-section-title {
+    font-size: 26px;
+    font-weight: 800;
+    color: #16264a;
+    margin-top: 6px;
+    margin-bottom: 2px;
+}
+.agilo-section-caption {
+    color: #8a94a6;
+    font-size: 14px;
+    margin-bottom: 14px;
+}
+.field-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    color: #6b7482;
+    text-transform: uppercase;
+    margin-bottom: 2px;
+}
+div[data-testid="stTextInput"] input {
+    background-color: #f3f5f8 !important;
+    border: 1px solid #e3e7ee !important;
+    border-radius: 8px !important;
+}
+.agilo-info-box {
+    background-color: #eaf2ff;
+    border-radius: 10px;
+    padding: 14px 18px;
+    color: #2c3e5c;
+    font-size: 14.5px;
+    margin-top: 10px;
+}
+.agilo-sidebar-caption {
+    color: #8a94a6;
+    font-size: 12px;
+}
+</style>
+"""
 
-    st.markdown("---")
+MANUAL_FIELD_DEFS = [
+    ('PART NO', 'part_no'),
+    ('DESCRIPTION', 'description'),
+    ('MODEL', 'model'),
+    ('LOCATION', 'location'),
+    ('QTY/BIN', 'qty_bin'),
+    ('QTY/VEH', 'qty_veh'),
+    ('STORE LOCATION', 'store_location'),
+]
 
-    # Sidebar for configuration
-    st.sidebar.header("Configuration")
 
-    st.sidebar.subheader("Model Box")
+def dataframe_to_manual_labels(df):
+    """
+    Convert an uploaded mastersheet DataFrame into the manual-entry row
+    format used by the Labels section, so uploading a file bulk-prefills
+    the fields and the user can keep editing by hand from there.
+    """
+    if df is None or len(df) == 0:
+        return []
+
+    work_df = df.copy()
+    work_df.columns = [col.upper() if isinstance(col, str) else col for col in work_df.columns]
+    cols = work_df.columns.tolist()
+    if not cols:
+        return []
+
+    part_no_col = next((col for col in cols if 'PART' in col and ('NO' in col or 'NUM' in col or '#' in col)),
+                   next((col for col in cols if col in ['PARTNO', 'PART']), cols[0]))
+    desc_col = next((col for col in cols if 'DESC' in col),
+                   next((col for col in cols if 'NAME' in col), cols[1] if len(cols) > 1 else part_no_col))
+    qty_bin_col = next((col for col in cols if 'QTY/BIN' in col or 'QTY_BIN' in col or 'QTYBIN' in col),
+                  next((col for col in cols if 'QTY' in col and 'BIN' in col), None))
+    if not qty_bin_col:
+        qty_bin_col = next((col for col in cols if 'QTY' in col),
+                      next((col for col in cols if 'QUANTITY' in col), None))
+    loc_col = next((col for col in cols if 'LOC' in col or 'POS' in col or 'LOCATION' in col),
+                   cols[2] if len(cols) > 2 else desc_col)
+    qty_veh_col = next((col for col in cols if any(term in col for term in ['QTY/VEH', 'QTY_VEH', 'QTY PER VEH', 'QTYVEH', 'QTYPERCAR', 'QTYCAR', 'QTY/CAR'])), None)
+    store_loc_col = next((col for col in cols if 'STORE' in col and 'LOC' in col),
+                      next((col for col in cols if 'STORELOCATION' in col), None))
+    model_col = find_model_column(cols)
+
+    def clean(val):
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return ''
+        if pd.isna(val):
+            return ''
+        if isinstance(val, float) and val.is_integer():
+            return str(int(val))
+        return str(val).strip()
+
+    rows = []
+    for _, row in work_df.iterrows():
+        rows.append({
+            'part_no': clean(row[part_no_col]) if part_no_col else '',
+            'description': clean(row[desc_col]) if desc_col else '',
+            'model': clean(row[model_col]) if model_col and model_col in row else '',
+            'location': clean(row[loc_col]) if loc_col else '',
+            'qty_bin': clean(row[qty_bin_col]) if qty_bin_col else '',
+            'qty_veh': clean(row[qty_veh_col]) if qty_veh_col else '',
+            'store_location': clean(row[store_loc_col]) if store_loc_col else '',
+        })
+    return rows
+
+
+def _init_session_state():
+    if 'manual_labels' not in st.session_state:
+        st.session_state.manual_labels = [{}]
+    if 'last_prefill_signature' not in st.session_state:
+        st.session_state.last_prefill_signature = None
+
+
+def _render_sidebar():
+    st.sidebar.markdown("## Settings")
+
+    st.sidebar.markdown("**Model Box**")
     model_choice = st.sidebar.radio(
         "Print the model box on the labels?",
         options=["Include", "Exclude"],
         index=0,
+        label_visibility="collapsed",
         help=(
             "Include: the model box is printed, with model labels (e.g. 7M, 9M, "
             "12M, Type-A, or whatever your file actually contains) detected "
@@ -775,204 +911,90 @@ def main():
     )
     include_model_box = (model_choice == "Include")
 
-    # ---- Choose how labels are added ----
-    st.header("📁 Add Labels")
-    entry_mode = st.radio(
-        "How would you like to add labels?",
-        options=["Upload file (bulk)", "Manual entry (1-2 labels)"],
-        index=0,
-        horizontal=True,
-        help="Use bulk upload for many labels at once. Use manual entry when you just need one or two labels quickly."
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Optional: upload to prefill")
+    st.sidebar.markdown(
+        "<div class='agilo-sidebar-caption'>Upload a mastersheet (.xlsx/.csv) any time to "
+        "bulk-prefill the labels below, then keep editing by hand.</div>",
+        unsafe_allow_html=True
     )
 
-    if entry_mode == "Upload file (bulk)":
-        _run_bulk_upload_flow(include_model_box)
-    else:
-        _run_manual_entry_flow(include_model_box)
+    uploaded_prefill = st.sidebar.file_uploader(
+        "Upload mastersheet",
+        type=['xlsx', 'xls', 'csv'],
+        key='prefill_uploader',
+        label_visibility="collapsed"
+    )
 
+    if uploaded_prefill is not None:
+        signature = f"{uploaded_prefill.name}_{uploaded_prefill.size}"
+        if st.session_state.last_prefill_signature != signature:
+            try:
+                if uploaded_prefill.name.lower().endswith('.csv'):
+                    prefill_df = pd.read_csv(uploaded_prefill)
+                else:
+                    prefill_df = pd.read_excel(uploaded_prefill)
 
-def _run_bulk_upload_flow(include_model_box):
-    st.caption("New to this? Download a blank template, fill it in, then upload it below.")
-    st.download_button(
+                new_rows = dataframe_to_manual_labels(prefill_df)
+                if new_rows:
+                    st.session_state.manual_labels = new_rows
+                    st.session_state.last_prefill_signature = signature
+                    st.sidebar.success(f"✅ Loaded {len(new_rows)} label(s) from {uploaded_prefill.name}")
+                    st.rerun()
+                else:
+                    st.sidebar.warning("No rows found in that file.")
+            except Exception as e:
+                st.sidebar.error(f"Error reading file: {e}")
+
+    st.sidebar.download_button(
         label="📄 Download blank mastersheet template",
         data=create_blank_mastersheet_bytes(),
         file_name="mastersheet_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
     )
 
-    uploaded_file = st.file_uploader(
-        "Choose an Excel or CSV file",
-        type=['xlsx', 'xls', 'csv'],
-        help="Upload your Excel or CSV file containing part information"
+    return include_model_box
+
+
+def _render_header():
+    if os.path.exists(LOGO_FILENAME):
+        logo_col = st.columns([1, 1.4, 1])[1]
+        with logo_col:
+            st.image(LOGO_FILENAME, use_container_width=True)
+
+    st.markdown("<div class='agilo-title'>Bin Label Generator</div>", unsafe_allow_html=True)
+    st.markdown("<div class='agilo-subtitle'>PART BIN LABEL GENERATOR</div>", unsafe_allow_html=True)
+    st.markdown("<div class='agilo-gradient-bar'></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='agilo-desc'>Add labels below by filling in the blanks — no spreadsheet to "
+        "wrangle. Upload a mastersheet any time in the sidebar to bulk-prefill the fields, then "
+        "keep editing by hand. A 10&nbsp;cm&nbsp;x&nbsp;15&nbsp;cm label is generated for every "
+        "entry.</div>",
+        unsafe_allow_html=True
     )
 
-    if uploaded_file is not None:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            temp_input_path = tmp_file.name
 
-        st.success(f"✅ File uploaded: {uploaded_file.name}")
-
-        try:
-            if uploaded_file.name.lower().endswith('.csv'):
-                preview_df = pd.read_csv(temp_input_path).head(5)
-            else:
-                preview_df = pd.read_excel(temp_input_path).head(5)
-
-            st.subheader("📊 Data Preview (First 5 rows)")
-            st.dataframe(preview_df, use_container_width=True)
-
-        except Exception as e:
-            st.error(f"Error previewing file: {e}")
-            return
-
-        # Column mapping section
-        st.subheader("🔧 Column Detection")
-
-        try:
-            if uploaded_file.name.lower().endswith('.csv'):
-                df_full = pd.read_csv(temp_input_path)
-            else:
-                df_full = pd.read_excel(temp_input_path)
-
-            cols_upper = [col.upper() if isinstance(col, str) else col for col in df_full.columns]
-
-            part_no_col = next((col for col in cols_upper if 'PART' in col and ('NO' in col or 'NUM' in col or '#' in col)),
-                             next((col for col in cols_upper if col in ['PARTNO', 'PART']), cols_upper[0] if cols_upper else ''))
-
-            desc_col = next((col for col in cols_upper if 'DESC' in col),
-                           next((col for col in cols_upper if 'NAME' in col), cols_upper[1] if len(cols_upper) > 1 else ''))
-
-            qty_bin_col = next((col for col in cols_upper if 'QTY/BIN' in col or 'QTY_BIN' in col or 'QTYBIN' in col),
-                              next((col for col in cols_upper if 'QTY' in col and 'BIN' in col),
-                                   next((col for col in cols_upper if 'QTY' in col), '')))
-
-            loc_col = next((col for col in cols_upper if 'LOC' in col or 'POS' in col or 'LOCATION' in col), '')
-
-            qty_veh_col_disp = next((col for col in cols_upper if any(term in col for term in ['QTY/VEH', 'QTY_VEH', 'QTY PER VEH', 'QTYVEH'])), '')
-
-            model_col_disp = find_model_column(df_full.columns.tolist())
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                st.info(f"**Part Number Column:** {part_no_col}")
-                st.info(f"**Description Column:** {desc_col}")
-                st.info(f"**Location Column:** {loc_col}")
-
-            with col2:
-                st.info(f"**Qty/Bin Column:** {qty_bin_col}")
-                st.info(f"**Qty/Vehicle Column:** {qty_veh_col_disp if qty_veh_col_disp else 'Not detected'}")
-                st.info(f"**Model Column:** {model_col_disp if model_col_disp else 'Not detected'}")
-
-            # Show which models were actually detected in this file
-            if include_model_box:
-                df_check = df_full.copy()
-                df_check.columns = [c.upper() if isinstance(c, str) else c for c in df_check.columns]
-                qty_veh_col_check = next((col for col in df_check.columns if any(term in str(col) for term in ['QTY/VEH', 'QTY_VEH', 'QTY PER VEH', 'QTYVEH', 'QTYPERCAR', 'QTYCAR', 'QTY/CAR'])), None)
-                model_col_check = find_model_column(df_check.columns.tolist())
-                detected_models = get_unique_models(df_check, model_col_check, qty_veh_col_check)
-                if detected_models:
-                    st.success(f"📋 Models detected in this file: {', '.join(detected_models)}")
-                else:
-                    st.warning("📋 Include is selected, but no model data was found in this file — the box won't be printed.")
-
-        except Exception as e:
-            st.error(f"Error analyzing columns: {e}")
-            return
-
-        # Generate labels section
-        st.subheader("🚀 Generate Labels")
-
-        col1, col2, col3 = st.columns([1, 1, 2])
-
-        with col1:
-            if st.button("🏷️ Generate PDF Labels", type="primary", use_container_width=True):
-                status_container = st.empty()
-
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_output:
-                    temp_output_path = tmp_output.name
-
-                def update_status(message):
-                    status_container.info(f"📊 {message}")
-
-                try:
-                    update_status("Starting label generation...")
-
-                    result_path = generate_sticker_labels(
-                        temp_input_path,
-                        temp_output_path,
-                        status_callback=update_status,
-                        include_model_box=include_model_box
-                    )
-
-                    if result_path:
-                        with open(result_path, 'rb') as pdf_file:
-                            pdf_data = pdf_file.read()
-
-                        status_container.success("✅ Labels generated successfully!")
-
-                        st.download_button(
-                            label="📥 Download PDF Labels",
-                            data=pdf_data,
-                            file_name=f"sticker_labels_{uploaded_file.name.split('.')[0]}.pdf",
-                            mime="application/pdf",
-                            use_container_width=True
-                        )
-
-                        file_size = len(pdf_data) / 1024
-                        st.info(f"📄 PDF size: {file_size:.1f} KB | Pages: {len(df_full)}")
-
-                    else:
-                        status_container.error("❌ Failed to generate labels")
-
-                except Exception as e:
-                    status_container.error(f"❌ Error: {str(e)}")
-                    st.exception(e)
-
-                finally:
-                    try:
-                        if os.path.exists(temp_input_path):
-                            os.unlink(temp_input_path)
-                        if os.path.exists(temp_output_path):
-                            os.unlink(temp_output_path)
-                    except Exception:
-                        pass
-
-        with col2:
-            if st.button("🔍 Preview Sample", use_container_width=True):
-                st.info("Preview functionality - shows first label design")
-
-        _render_info_sections()
-
-    else:
-        st.info("👆 Please upload an Excel or CSV file to get started")
-        _render_bulk_instructions()
-        _render_sample_data()
-
-
-def _run_manual_entry_flow(include_model_box):
-    if 'manual_labels' not in st.session_state:
-        st.session_state.manual_labels = [{}]
-
-    st.caption(
-        "Fill in the blanks for each label below — no spreadsheet needed. "
-        "Add more labels or remove ones you don't need."
+def _render_labels_section():
+    st.markdown("<div class='agilo-section-title'>Labels</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='agilo-section-caption'>Fill in the blanks for each label. "
+        "Add more labels or remove ones you don't need.</div>",
+        unsafe_allow_html=True
     )
 
     to_remove = None
     for i, label in enumerate(st.session_state.manual_labels):
-        cols = st.columns([1.2, 1.6, 0.9, 1.2, 0.8, 0.8, 1.3, 0.3])
-        label['part_no'] = cols[0].text_input("Part No", value=label.get('part_no', ''), key=f"part_no_{i}")
-        label['description'] = cols[1].text_input("Description", value=label.get('description', ''), key=f"desc_{i}")
-        label['model'] = cols[2].text_input("Model", value=label.get('model', ''), key=f"model_{i}")
-        label['location'] = cols[3].text_input("Location", value=label.get('location', ''), key=f"loc_{i}")
-        label['qty_bin'] = cols[4].text_input("Qty/Bin", value=label.get('qty_bin', ''), key=f"qtybin_{i}")
-        label['qty_veh'] = cols[5].text_input("Qty/Veh", value=label.get('qty_veh', ''), key=f"qtyveh_{i}")
-        label['store_location'] = cols[6].text_input("Store Location", value=label.get('store_location', ''), key=f"storeloc_{i}")
-        cols[7].markdown("<div style='height: 1.85em'></div>", unsafe_allow_html=True)
-        if cols[7].button("✕", key=f"remove_{i}", help="Remove this label"):
-            to_remove = i
+        with st.container(border=True):
+            cols = st.columns([1.2, 1.6, 0.9, 1.2, 0.8, 0.8, 1.3, 0.3])
+            for col, (caption, key) in zip(cols[:7], MANUAL_FIELD_DEFS):
+                col.markdown(f"<div class='field-label'>{caption}</div>", unsafe_allow_html=True)
+                label[key] = col.text_input(
+                    caption, value=label.get(key, ''), key=f"{key}_{i}", label_visibility="collapsed"
+                )
+            cols[7].markdown("<div style='height: 1.6em'></div>", unsafe_allow_html=True)
+            if cols[7].button("✕", key=f"remove_{i}", help="Remove this label"):
+                to_remove = i
 
     if to_remove is not None:
         if len(st.session_state.manual_labels) > 1:
@@ -985,35 +1007,30 @@ def _run_manual_entry_flow(include_model_box):
         st.session_state.manual_labels.append({})
         st.rerun()
 
-    st.markdown("---")
-    st.caption(
-        "Need more than a couple of labels? Switch to **Upload file (bulk)** above, "
-        "or download a blank template to fill in offline and upload later."
-    )
-    st.download_button(
-        label="📄 Download blank mastersheet template",
-        data=create_blank_mastersheet_bytes(),
-        file_name="mastersheet_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    return [
+        {
+            'Part No': label.get('part_no', ''),
+            'Description': label.get('description', ''),
+            'Model': label.get('model', ''),
+            'Location': label.get('location', ''),
+            'Qty/Bin': label.get('qty_bin', ''),
+            'Qty/Veh': label.get('qty_veh', ''),
+            'Store Location': label.get('store_location', ''),
+        }
+        for label in st.session_state.manual_labels
+        if any(str(v).strip() for v in label.values())
+    ]
 
-    rows = []
-    for label in st.session_state.manual_labels:
-        if any(str(v).strip() for v in label.values()):
-            rows.append({
-                'Part No': label.get('part_no', ''),
-                'Description': label.get('description', ''),
-                'Model': label.get('model', ''),
-                'Location': label.get('location', ''),
-                'Qty/Bin': label.get('qty_bin', ''),
-                'Qty/Veh': label.get('qty_veh', ''),
-                'Store Location': label.get('store_location', ''),
-            })
 
-    st.subheader("🚀 Generate Labels")
+def _render_generate_section(rows, include_model_box):
+    st.markdown("<br>", unsafe_allow_html=True)
 
     if not rows:
-        st.info("Fill in at least one label's blanks (Part No, Description) to generate labels.")
+        st.markdown(
+            "<div class='agilo-info-box'>Fill in at least one label's blanks "
+            "(Part No, Description) to generate labels.</div>",
+            unsafe_allow_html=True
+        )
         return
 
     if st.button("🏷️ Generate PDF Labels", type="primary"):
@@ -1045,7 +1062,7 @@ def _run_manual_entry_flow(include_model_box):
                 st.download_button(
                     label="📥 Download PDF Labels",
                     data=pdf_data,
-                    file_name="sticker_labels_manual.pdf",
+                    file_name="sticker_labels.pdf",
                     mime="application/pdf",
                     use_container_width=True
                 )
@@ -1067,69 +1084,56 @@ def _run_manual_entry_flow(include_model_box):
                 pass
 
 
-def _render_info_sections():
-    st.subheader("ℹ️ Label Information")
+def _render_help_sections():
+    with st.expander("ℹ️ Label information & tips"):
+        info_col1, info_col2 = st.columns(2)
 
-    info_col1, info_col2 = st.columns(2)
+        with info_col1:
+            st.markdown("""
+            **Label Features:**
+            - 📏 Standard sticker size (10cm x 15cm)
+            - 🔢 QR code for each part (Part No, Qty, Delivery Location, Storage Location)
+            - 📍 Location tracking
+            - 🏷️ Model box — models detected directly from your data, Include/Exclude toggle
+            - 📦 Quantity per bin/vehicle
+            """)
 
-    with info_col1:
-        st.markdown("""
-        **Label Features:**
-        - 📏 Standard sticker size (10cm x 15cm)
-        - 🔢 QR code for each part (Part No, Qty, Delivery Location, Storage Location)
-        - 📍 Location tracking
-        - 🏷️ Model box — models detected directly from your data, Include/Exclude toggle
-        - 📦 Quantity per bin/vehicle
-        """)
+        with info_col2:
+            st.markdown("""
+            **Tips:**
+            - Model labels are read straight from your data — "7M", "9M", "12M",
+              "Type-A", or any other model names your product line uses; nothing is hardcoded
+            - Clients that don't use models at all can pick **"Exclude"** in the sidebar
+            - Only need 1-2 labels? Just fill in the blanks below — no file needed
+            - Have many parts? Upload a mastersheet in the sidebar to prefill everything at once
+            """)
 
-    with info_col2:
-        st.markdown("""
-        **Supported Columns:**
-        - Part Number/Part No
-        - Description/Name
-        - Location/Position
-        - Qty/Bin, Quantity
-        - Qty/Veh, Qty per Vehicle
-        - Model/Product Type
-        - Store Location
-        """)
-
-
-def _render_bulk_instructions():
-    st.subheader("📋 Instructions")
-    st.markdown("""
-    1. **Choose Include or Exclude** for the Model Box in the sidebar
-    2. **Download the blank template** (optional) and fill it in with your data
-    3. **Upload your file** - Excel (.xlsx, .xls) or CSV format
-    4. **Review data preview** - Check if your data looks correct
-    5. **Verify column detection** - Ensure columns are properly identified
-    6. **Generate labels** - Click the button to create your PDF
-    7. **Download** - Get your professional sticker labels
-    """)
-
-    st.subheader("💡 Tips")
-    st.markdown("""
-    - Use clear column headers like "Part No", "Description", "Location"
-    - Model labels are read straight from your file — "7M", "9M", "12M", "Type-A", or any
-      other model names your product line uses; nothing is hardcoded
-    - Include quantity information in "Qty/Bin" or "Qty/Veh" columns
-    - Location strings will be automatically parsed into components
-    - Clients that don't use models at all can simply pick **"Exclude"** in the sidebar
-    - Only need 1 or 2 labels? Switch to **"Manual entry"** above instead of uploading a file
-    """)
+        st.markdown("**Sample mastersheet format:**")
+        sample_data = pd.DataFrame({
+            'Part No': ['ABC123', 'DEF456', 'GHI789'],
+            'Description': ['Engine Filter', 'Brake Pad Set', 'Oil Filter'],
+            'Location': ['A1_B2_C3', 'D4_E5_F6', 'G7_H8_I9'],
+            'Qty/Bin': [5, 10, 8],
+            'Qty/Veh': [2, 4, 1],
+            'Model': ['9M', '12M', '7M']
+        })
+        st.dataframe(sample_data, use_container_width=True)
 
 
-def _render_sample_data():
-    st.subheader("📊 Sample Data Format")
-    sample_data = pd.DataFrame({
-        'Part No': ['ABC123', 'DEF456', 'GHI789'],
-        'Description': ['Engine Filter', 'Brake Pad Set', 'Oil Filter'],
-        'Location': ['A1_B2_C3', 'D4_E5_F6', 'G7_H8_I9'],
-        'Qty/Bin': [5, 10, 8],
-        'Qty/Veh': [2, 4, 1],
-        'Model': ['9M', '12M', '7M']
-    })
-    st.dataframe(sample_data, use_container_width=True)
+def main():
+    """Main Streamlit application"""
+    st.set_page_config(page_title="Bin Label Generator", page_icon="🏷️", layout="wide")
+    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+    _init_session_state()
+    include_model_box = _render_sidebar()
+
+    _render_header()
+    rows = _render_labels_section()
+    _render_generate_section(rows, include_model_box)
+
+    st.markdown("---")
+    _render_help_sections()
 
 
 if __name__ == "__main__":
